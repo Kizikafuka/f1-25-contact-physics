@@ -1,0 +1,302 @@
+{
+  "schema_version": 1,
+  "id": "kizi.ai-tweaks",
+  "name": "Contact Physics",
+  "version": "0.5.9",
+  "author": "Kizi",
+  "description": "Cars react to hits like real ones: the AI holds its steering for a moment and spins from the hit. Softening off, wheel-to-wheel push on. Experimental.",
+  "license": "MIT",
+  "repository": "https://github.com/Kizikafuka/f1-25-contact-physics",
+  "icon": "icon.png",
+  "category": "ai",
+  "kind": [
+    "native"
+  ],
+  "compat": {
+    "game": "f1_25",
+    "launcher": ">=1.8.19"
+  },
+  "requires": [
+    {
+      "id": "swofty.core",
+      "version": ">=0.1.0"
+    }
+  ],
+  "options": [
+    {
+      "id": "reaction",
+      "type": "choice",
+      "label": "Contact: AI reaction time",
+      "description": "After a hit, the AI car's steering is held where it was for this long (0.2, 0.4 or 0.6 s) before the AI reacts, so the hit can turn the car.",
+      "values": [
+        {
+          "value": "off",
+          "label": "Off (game)"
+        },
+        {
+          "value": "0.2",
+          "label": "0.2 s"
+        },
+        {
+          "value": "0.4",
+          "label": "0.4 s"
+        },
+        {
+          "value": "0.6",
+          "label": "0.6 s"
+        }
+      ],
+      "default": "0.2",
+      "binds": "native"
+    },
+    {
+      "id": "contact_spin",
+      "type": "choice",
+      "label": "Contact: AI spin from hits",
+      "description": "Adds the yaw a real hit would give an AI car, worked out from where the cars touched and how fast they closed. Light, Medium or Strong.",
+      "values": [
+        {
+          "value": "off",
+          "label": "Off"
+        },
+        {
+          "value": "light",
+          "label": "Light"
+        },
+        {
+          "value": "medium",
+          "label": "Medium"
+        },
+        {
+          "value": "strong",
+          "label": "Strong"
+        }
+      ],
+      "default": "strong",
+      "binds": "native"
+    },
+    {
+      "id": "twitch",
+      "type": "choice",
+      "label": "Contact: twitch when hit",
+      "description": "Gives every AI car in a contact at least a small yaw twitch. Needs \"AI spin from hits\" on.",
+      "values": [
+        {
+          "value": "off",
+          "label": "Off"
+        },
+        {
+          "value": "small",
+          "label": "Small"
+        },
+        {
+          "value": "medium",
+          "label": "Medium"
+        }
+      ],
+      "default": "medium",
+      "binds": "native"
+    },
+    {
+      "id": "spin_who",
+      "type": "choice",
+      "label": "Contact: applies to",
+      "description": "Which contacts get the reaction time and the spin: all of them (AI against AI too), or only contacts with you.",
+      "values": [
+        {
+          "value": "all",
+          "label": "All contacts (AI vs AI too)"
+        },
+        {
+          "value": "you",
+          "label": "Only contacts with you"
+        }
+      ],
+      "default": "all",
+      "binds": "native"
+    },
+    {
+      "id": "spin_target",
+      "type": "choice",
+      "label": "Contact: who spins",
+      "description": "Which car of a touching pair gets the extra spin: both, only the car behind (the one that hit), or only the car ahead (the one that was hit).",
+      "values": [
+        {
+          "value": "both",
+          "label": "Both cars"
+        },
+        {
+          "value": "behind",
+          "label": "Car behind only"
+        },
+        {
+          "value": "ahead",
+          "label": "Car ahead only"
+        }
+      ],
+      "default": "both",
+      "binds": "native"
+    },
+    {
+      "id": "rear_boost",
+      "type": "choice",
+      "label": "Contact: rear hit spins the car ahead",
+      "description": "When the car ahead is hit behind its centre (a hit on the rear tyre), it gets at least this much spin, so a punt from behind can send it round.",
+      "values": [
+        {
+          "value": "off",
+          "label": "Off"
+        },
+        {
+          "value": "small",
+          "label": "Small"
+        },
+        {
+          "value": "medium",
+          "label": "Medium"
+        },
+        {
+          "value": "strong",
+          "label": "Strong"
+        }
+      ],
+      "default": "strong",
+      "binds": "native"
+    },
+    {
+      "id": "wheel_lift",
+      "type": "choice",
+      "label": "Contact: wheel-over-wheel lift",
+      "description": "When a tyre rides up on another car, the car behind is lifted at the wheel that touched (a rear-wheel touch lifts the rear). Experimental; separate from the wheel push.",
+      "values": [
+        {
+          "value": "off",
+          "label": "Off"
+        },
+        {
+          "value": "small",
+          "label": "Small"
+        },
+        {
+          "value": "medium",
+          "label": "Medium"
+        },
+        {
+          "value": "strong",
+          "label": "Strong"
+        }
+      ],
+      "default": "strong",
+      "binds": "native"
+    },
+    {
+      "id": "puncture",
+      "type": "choice",
+      "label": "Contact: tyre punctures",
+      "description": "A hit at a tyre can give it a puncture, the more likely the harder the touch (touches under 10 km/h never do, full chance from 60 km/h). Uses the game's own puncture, so the tyre loses air and may burst.",
+      "values": [
+        {
+          "value": "off",
+          "label": "Off"
+        },
+        {
+          "value": "rare",
+          "label": "Rare"
+        },
+        {
+          "value": "sometimes",
+          "label": "Sometimes"
+        },
+        {
+          "value": "often",
+          "label": "Often"
+        }
+      ],
+      "default": "sometimes",
+      "binds": "native"
+    },
+    {
+      "id": "puncture_you",
+      "type": "toggle",
+      "label": "Contact: punctures can hit you",
+      "description": "Off = only AI cars get punctures from contact. On = your tyres too.",
+      "default": false,
+      "binds": "native"
+    },
+    {
+      "id": "softening",
+      "type": "choice",
+      "label": "Contact: softening",
+      "description": "The game softens every car-to-car hit with two assists. Off = hits are not softened. Ctrl+F9 switches it during a race.",
+      "values": [
+        {
+          "value": "off",
+          "label": "Off (realistic)"
+        },
+        {
+          "value": "game",
+          "label": "Game default"
+        }
+      ],
+      "default": "off",
+      "binds": "native"
+    },
+    {
+      "id": "wheel_push",
+      "type": "choice",
+      "label": "Contact: wheel-to-wheel push",
+      "description": "Touching tyres push the cars apart. The game ships this off. Levels from Subtle to Extreme; Extreme can throw cars. Ctrl+F10 cycles it during a race.",
+      "values": [
+        {
+          "value": "game",
+          "label": "Off (game)"
+        },
+        {
+          "value": "subtle",
+          "label": "Subtle"
+        },
+        {
+          "value": "light",
+          "label": "Light"
+        },
+        {
+          "value": "medium",
+          "label": "Medium"
+        },
+        {
+          "value": "strong",
+          "label": "Strong"
+        },
+        {
+          "value": "extreme",
+          "label": "Extreme"
+        }
+      ],
+      "default": "medium",
+      "binds": "native"
+    },
+    {
+      "id": "osd_message",
+      "type": "toggle",
+      "label": "On-screen messages",
+      "description": "Shows on-screen messages in the game's race notification.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "contact_log",
+      "type": "toggle",
+      "label": "Testing: log contacts",
+      "description": "Writes every car-to-car touch to swofty\\loader.log (who touched, how hard, how far each car turned). Only for testing; leave off.",
+      "default": false,
+      "binds": "native"
+    }
+  ],
+  "operations": {
+    "native": [
+      {
+        "dll": "native/kizi_ai_tweaks.dll"
+      }
+    ]
+  }
+}

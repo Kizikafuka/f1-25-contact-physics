@@ -1,0 +1,12 @@
+How to build kizi.ai-tweaks (Contact Physics) from this source
+============================================
+Needs Zig 0.17 (https://ziglang.org) and the Swofty SDK headers (packages/sdk/include from
+https://github.com/Swofty-Developments/SwoftyLauncher, MIT).
+
+  zig c++ -target x86_64-windows-gnu -std=c++23 -O2 -shared -s -I<sdk include> -I common ^
+      -o kizi_ai_tweaks.dll native\src\ai_tweaks.cpp res\dll.rc -lkernel32
+
+native\src\ai_tweaks.cpp   the in-game part (contact softening, wheel-to-wheel push, hotkeys)
+native\src\osd.hpp         on-screen messages (the game's race notification)
+common\kizi_mem.hpp        small memory helpers
+tools\make_ops.py          regenerates db\ai.json from the game database (racecraft and car-control values)

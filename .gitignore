@@ -1,0 +1,10 @@
+# build output
+dist/
+bin/
+native/*.dll
+native/*.lib
+native/*.exe
+*.lib
+# Swofty SDK headers are not part of this repository
+native/include/swofty/
+native/include/swofty_api.h
