@@ -2,7 +2,7 @@
   "schema_version": 1,
   "id": "kizi.ai-tweaks",
   "name": "Contact Physics",
-  "version": "0.5.9",
+  "version": "0.5.10",
   "author": "Kizi",
   "description": "Cars react to hits like real ones: the AI holds its steering for a moment and spins from the hit. Softening off, wheel-to-wheel push on. Experimental.",
   "license": "MIT",
@@ -14,7 +14,8 @@
   ],
   "compat": {
     "game": "f1_25",
-    "launcher": ">=1.8.19"
+    "launcher": ">=1.8.36",
+    "platforms": ["steam"]
   },
   "requires": [
     {

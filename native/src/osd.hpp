@@ -81,7 +81,7 @@ inline void draw_text(SwoftyPaint *p, float x, float y, float px, uint32_t rgba,
 
 inline void paint(SwoftyPaint *p, void *)
 {
-    if (!enabled || int(until.load() - GetTickCount()) <= 0)
+    if (!enabled || !until.load() || int(until.load() - GetTickCount()) <= 0)
         return;
     std::string a, b;
     {
