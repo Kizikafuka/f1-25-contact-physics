@@ -13,7 +13,7 @@
 // The game copies these values from its database when the collision system starts, possibly after this plugin
 // loads, so a worker re-applies the chosen state about once a second.
 //
-// Hotkeys (game window focused): Ctrl+F9 softening on/off, Ctrl+F10 cycles the wheel-to-wheel push. Each beeps;
+// Hotkeys (game window focused): Ctrl+F9 softening on/off, Ctrl+F10 cycles the wheel-to-wheel push (Classic only). Each beeps;
 // a message also shows in the game's race notification.
 #include <algorithm>
 #include <atomic>
@@ -34,13 +34,42 @@ SWOFTY_SETTING(bool, osd_message, true);
 SWOFTY_SETTING(bool, contact_log, false);
 SWOFTY_SETTING(std::string_view, contact_spin, "strong");
 SWOFTY_SETTING(std::string_view, spin_who, "all");
-SWOFTY_SETTING(std::string_view, reaction, "0.2");
+SWOFTY_SETTING(std::string_view, reaction, "scaled");
 SWOFTY_SETTING(std::string_view, twitch, "medium");
 SWOFTY_SETTING(std::string_view, spin_target, "both");
 SWOFTY_SETTING(std::string_view, rear_boost, "strong");
 SWOFTY_SETTING(std::string_view, wheel_lift, "strong");
 SWOFTY_SETTING(std::string_view, puncture, "sometimes");
 SWOFTY_SETTING(bool, puncture_you, false);
+// Physics mode. 0.6.1: the rigid-body response of common/kizi_contact_sim.hpp (impulse from both cars' mass and inertia at the
+// contact point, bounce, friction, rolling tyres rubbing, AI cars pushed too) is THE contact physics; the option is no longer
+// in the menu, so this default always applies. "classic" (the made-up spin / twitch / rear-hit / lift / wheel push below,
+// 0.5.x behaviour) is kept in the code only so it can come back by re-adding the option.
+SWOFTY_SETTING(std::string_view, physics_mode, "realistic");
+SWOFTY_SETTING(std::string_view, exaggerate, "off");
+SWOFTY_SETTING(std::string_view, restitution, "medium");
+SWOFTY_SETTING(std::string_view, friction, "medium");
+SWOFTY_SETTING(std::string_view, engine_response, "add");
+SWOFTY_SETTING(bool, tyre_spin, true);
+SWOFTY_SETTING(bool, ai_impulse, true);
+
+namespace sim::cfg {
+inline bool active() { return physics_mode.get() == "realistic"; }
+inline std::string_view normal_mode() { return "full"; }
+inline std::string_view apply_to() { return spin_who.get(); }
+inline bool contact_log() { return ::contact_log.get(); }
+inline std::string_view restitution() { return ::restitution.get(); }
+inline std::string_view friction() { return ::friction.get(); }
+inline std::string_view separation() { return "low"; }
+inline std::string_view engine_response() { return ::engine_response.get(); }
+inline std::string_view exaggerate() { return ::exaggerate.get(); }
+inline bool tyre_spin() { return ::tyre_spin.get(); }
+inline bool ai_impulse() { return ::ai_impulse.get(); }
+}  // namespace sim::cfg
+#define KIZI_SIM_EMBED 1
+#define KIZI_SIM_HEAVY 1
+#define SIM_TAG "[ai-tweaks] realistic:"
+#include "kizi_contact_sim.hpp"
 
 namespace {
 
@@ -198,6 +227,8 @@ uintptr_t slot_of(const char *pattern, const char *what)
 
 int push_index()
 {
+    if (sim::cfg::active())
+        return 0;                                  // Realistic: the rolling-tyre rub replaces the game's wheel push
     int k = g_push_key;
     if (k >= 0)
         return k;
@@ -397,14 +428,20 @@ void log_contacts()
 // + the kick fading out linearly), checked every millisecond - the AI cannot correct it away before the car turns.
 // Smallest extra yaw a hit AI car gets (rad/s): a push that lands where it hardly turns the car (e.g. straight into
 // the rear wheel) still gives a visible twitch, in the direction the push turns it.
+bool realistic() { return sim::cfg::active(); }
+
 float twitch_min()
 {
+    if (realistic())
+        return 0.0f;                               // Classic only
     std::string_view v = twitch.get();
     return v == "small" ? 0.25f : v == "medium" ? 0.45f : 0.0f;
 }
 
 float spin_level()
 {
+    if (realistic())
+        return 0.0f;
     std::string_view v = contact_spin.get();
     return v == "light" ? 0.35f : v == "medium" ? 0.7f : v == "strong" ? 1.0f : 0.0f;
 }
@@ -413,6 +450,8 @@ float spin_level()
 // push turns it hardest in a real crash.
 float rear_min()
 {
+    if (realistic())
+        return 0.0f;
     std::string_view v = rear_boost.get();
     return v == "small" ? 0.5f : v == "medium" ? 0.9f : v == "strong" ? 1.4f : 0.0f;
 }
@@ -421,6 +460,8 @@ float rear_min()
 // other car: the contact normal then points partly up.
 float lift_gain()
 {
+    if (realistic())
+        return 0.0f;
     std::string_view v = wheel_lift.get();
     return v == "small" ? 1.5f : v == "medium" ? 3.0f : v == "strong" ? 5.0f : 0.0f;
 }
@@ -538,17 +579,25 @@ uint64_t ctrl_update_hook(void *self)
     uint64_t r = g_ctrl_update(self);
     auto c = static_cast<uint8_t *>(self);
     uint8_t idx = c[0x18];
-    if (idx < 32 && int(g_stun[idx].until.load() - GetTickCount()) > 0)
+    if (idx < 32 && g_stun[idx].until.load() && int(g_stun[idx].until.load() - GetTickCount()) > 0)
         if (auto out = *reinterpret_cast<uint8_t **>(c + 8))
             *reinterpret_cast<float *>(out + 0x14) = g_stun[idx].steer;
     return r;
 }
 
-DWORD reaction_ms()
+// How long the AI keeps its steering after a hit. Fixed (0.2 / 0.4 / 0.6 s), or "scaled": a light nudge is caught almost at
+// once and a big hit takes longer, from 0.1 s at a closing speed of 1 m/s or less to 1.0 s at 10 m/s or more (smooth curve).
+DWORD reaction_ms(float impact)
 {
     std::string_view v = reaction.get();
+    if (v == "scaled") {
+        float t = std::clamp((impact - 1.0f) / 9.0f, 0.0f, 1.0f);
+        return DWORD(100.0f + 900.0f * t * t * (3.0f - 2.0f * t));
+    }
     return v == "0.2" ? 200 : v == "0.4" ? 400 : v == "0.6" ? 600 : 0;
 }
+std::atomic<uint32_t> g_stun_ms_sum{0}, g_stun_ms_max{0};
+std::atomic<float> g_impact_max{0};
 
 // The AI controller of car idx, or 0.
 uintptr_t ai_ctrl(int idx)
@@ -587,18 +636,23 @@ void wrap_controllers()
     }
 }
 
-void stun(int idx)
+void stun(int idx, float impact)
 {
-    DWORD ms = reaction_ms();
+    DWORD ms = reaction_ms(impact);
     uintptr_t ai = ms ? ai_ctrl(idx) : 0;
     uint64_t out = 0;
     float steer = 0;
     if (!ai || idx >= 32 || !kizi::read(ai + 8, out) || !out || !kizi::read(out + 0x14, steer))
         return;
-    if (int(g_stun[idx].until.load() - GetTickCount()) <= 0)
+    if (!g_stun[idx].until.load() || int(g_stun[idx].until.load() - GetTickCount()) <= 0)
         g_stun[idx].steer = steer;                 // a new stun freezes the steering of this moment
     g_stun[idx].until = GetTickCount() + ms;
     g_stuns++;
+    g_stun_ms_sum += ms;
+    if (ms > g_stun_ms_max)
+        g_stun_ms_max = ms;
+    if (impact > g_impact_max)
+        g_impact_max = impact;
 }
 
 constexpr DWORD HOLD_MS = 250;
@@ -641,10 +695,20 @@ void on_record(uint64_t contact, uint64_t a, uint64_t b)
         return;
     if (spin_who.get() == "you" && !ha && !hb)
         return;                                    // AI-AI touch, but only touches with you count
+    float impact = 0;                              // closing speed along the contact normal at the first record of the touch
+    {
+        float nrm[3], v1[3], v2[3];
+        uint64_t b1 = body_of(a), b2 = body_of(b);
+        if (b1 && b2 && kizi::read(contact + 0x80, nrm, 12) && kizi::read(b1 + 0x220, v1, 12) && kizi::read(b2 + 0x220, v2, 12)) {
+            V3 nn{nrm[0], nrm[1], nrm[2]}, rv{v1[0] - v2[0], v1[1] - v2[1], v1[2] - v2[2]};
+            float l = len(nn);
+            impact = l > 0.5f ? std::fabs(dot(rv, nn)) / l : len(rv);
+        }
+    }
     if (!ha)
-        stun(car_id(a));
+        stun(car_id(a), impact);
     if (!hb)
-        stun(car_id(b));
+        stun(car_id(b), impact);
     if (float pc = puncture_chance(); pc > 0) {
         float pt[3], va2[3], vb2[3];
         uint64_t b1 = body_of(a), b2 = body_of(b);
@@ -786,7 +850,12 @@ void worker()
         if (tick % 20 == 0)
             wrap_controllers();
         if (tick % 600 == 0 && g_stuns)
-            swofty::log("[ai-tweaks] reaction time, last 30 s: %d AI car(s) slowed after a hit", g_stuns.exchange(0));
+        {
+            int n = g_stuns.exchange(0);
+            swofty::log("[ai-tweaks] reaction time, last 30 s: %d AI car(s) slowed after a hit, average %u ms, longest %u ms, "
+                        "hardest hit %.1f m/s", n, n ? g_stun_ms_sum.exchange(0) / unsigned(n) : 0u, g_stun_ms_max.exchange(0),
+                        double(g_impact_max.exchange(0)));
+        }
         if (tick % 600 == 0 && g_spins) {
             swofty::log("[ai-tweaks] contact spin, last 30 s: %d AI car(s) given spin, largest %.0f deg/s",
                         g_spins.exchange(0), g_spin_max.exchange(0) * 57.3f);
@@ -809,7 +878,7 @@ void worker()
             osd::show(off ? "CONTACT SOFTENING: OFF" : "CONTACT SOFTENING: GAME", off ? "REALISTIC CONTACT" : "");
             Beep(off ? 1000 : 500, 150);
         }
-        if (now10 && !down10) {
+        if (now10 && !down10 && !sim::cfg::active()) {   // the wheel push is a Classic feature
             int t = (push_index() + 1) % LEVELS;
             g_push_key = t;
             apply();
@@ -904,6 +973,8 @@ SWOFTY_ON_LOAD
     swofty::log("[ai-tweaks] contact spin %s (%.*s, %.*s)", g_ring ? "ready" : "NOT available",
                 (int)contact_spin.get().size(), contact_spin.get().data(), (int)spin_who.get().size(),
                 spin_who.get().data());
+    sim::start();                                  // its hook does nothing until Physics mode is Realistic
+    swofty::log("[ai-tweaks] physics mode: %.*s", (int)physics_mode.get().size(), physics_mode.get().data());
 }
 
 SWOFTY_ADDON()

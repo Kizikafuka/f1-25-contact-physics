@@ -1,7 +1,7 @@
 #include <windows.h>
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 0,5,9,0
-PRODUCTVERSION 0,5,9,0
+FILEVERSION 0,6,2,0
+PRODUCTVERSION 0,6,2,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_DLL
 BEGIN
@@ -11,12 +11,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "Kizi (open source, MIT)"
       VALUE "FileDescription", "Contact Physics, in-game part (kizi.ai-tweaks Swofty addon)"
-      VALUE "FileVersion", "0.5.9"
+      VALUE "FileVersion", "0.6.2"
       VALUE "InternalName", "kizi.ai-tweaks"
       VALUE "LegalCopyright", "MIT licence."
       VALUE "OriginalFilename", "kizi_ai_tweaks.dll"
       VALUE "ProductName", "Contact Physics for F1 25 (Swofty addon)"
-      VALUE "ProductVersion", "0.5.9"
+      VALUE "ProductVersion", "0.6.2"
     END
   END
   BLOCK "VarFileInfo"
