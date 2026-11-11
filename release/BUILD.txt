@@ -6,7 +6,7 @@ https://github.com/Swofty-Developments/SwoftyLauncher, MIT).
   zig c++ -target x86_64-windows-gnu -std=c++23 -O2 -shared -s -I<sdk include> -I common ^
       -o kizi_ai_tweaks.dll native\src\ai_tweaks.cpp res\dll.rc -lkernel32
 
-native\src\ai_tweaks.cpp   the in-game part (contact softening, wheel-to-wheel push, hotkeys)
-native\src\osd.hpp         on-screen messages (the game's race notification)
-common\kizi_mem.hpp        small memory helpers
-tools\make_ops.py          regenerates db\ai.json from the game database (racecraft and car-control values)
+native\src\ai_tweaks.cpp      the in-game part (softening, reaction time, punctures, hotkey, settings for the physics)
+native\src\osd.hpp            on-screen messages (the game's race notification)
+common\kizi_contact_sim.hpp   the contact physics (hook at the end of the game's contact code, rigid-body impulses)
+common\kizi_mem.hpp           small memory helpers
