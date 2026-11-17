@@ -2,9 +2,9 @@
   "schema_version": 1,
   "id": "kizi.ai-tweaks",
   "name": "Contact Physics",
-  "version": "0.6.2",
+  "version": "0.8.2",
   "author": "Kizi",
-  "description": "Rigid-body car contact for every car: mass, inertia, bounce, friction and rolling tyres that rub. AI reaction time that grows with the hit, softening off, punctures.",
+  "description": "What happens to a car in contact. Two models: Rigid body (mass, inertia, bounce, friction, rubbing tyres) or Classic (the 0.5 spin and tyre lift). Walls, aero loss, damage. AI driving: AI Driver Behaviour.",
   "license": "MIT",
   "repository": "https://github.com/Kizikafuka/f1-25-contact-physics",
   "icon": "icon.png",
@@ -27,10 +27,28 @@
   ],
   "options": [
     {
+      "id": "physics_mode",
+      "type": "choice",
+      "label": "Physics: contact model",
+      "description": "Rigid body = every touch calculated from both cars' mass, speed and contact point. Classic = the 0.5 contact: set spin, twitch and tyre lift effects (cars fly more on tyre contact).",
+      "values": [
+        {
+          "value": "realistic",
+          "label": "Rigid body (new)"
+        },
+        {
+          "value": "classic",
+          "label": "Classic (0.5)"
+        }
+      ],
+      "default": "realistic",
+      "binds": "native"
+    },
+    {
       "id": "exaggerate",
       "type": "choice",
-      "label": "Contact: strength",
-      "description": "How strong car contact is. Normal = tuned values (tyre friction 1.8, bodies 0.6, bounce 0.25). x1.5 / x2 / x3 scale bounce and friction (bounce max 0.8, friction max 3.0).",
+      "label": "Rigid body: strength",
+      "description": "How strong car contact is. Normal = tuned values (tyre friction 1.8, bodies 0.6, bounce 0.25). x1.5 / x2 / x3 scale bounce and friction (bounce max 0.8, friction max 3.0). Rigid body only.",
       "values": [
         {
           "value": "off",
@@ -55,8 +73,8 @@
     {
       "id": "restitution",
       "type": "choice",
-      "label": "Contact: bounce",
-      "description": "How much cars bounce apart after a hit: 0.1 / 0.25 / 0.4 of the closing speed.",
+      "label": "Rigid body: bounce",
+      "description": "How much cars bounce apart after a hit: 0.1 / 0.25 / 0.4 of the closing speed. Rigid body only.",
       "values": [
         {
           "value": "low",
@@ -77,8 +95,8 @@
     {
       "id": "friction",
       "type": "choice",
-      "label": "Contact: friction",
-      "description": "Grip between the touching parts: tyre on tyre 1.8, bodies 0.6 at Medium (Low x0.5, High x1.5).",
+      "label": "Rigid body: friction",
+      "description": "Grip between the touching parts: tyre on tyre 1.8, bodies 0.6 at Medium (Low x0.5, High x1.5). Rigid body only.",
       "values": [
         {
           "value": "off",
@@ -103,24 +121,24 @@
     {
       "id": "tyre_spin",
       "type": "toggle",
-      "label": "Contact: tyre rotation",
-      "description": "Rolling tyre surfaces rub in tyre-on-tyre touches (rubber on rubber), like real wheel-over-wheel contact: a chasing car can climb the tyre ahead and launch.",
+      "label": "Rigid body: tyre rotation",
+      "description": "Rolling tyre surfaces rub in tyre-on-tyre touches (rubber on rubber), like real wheel-over-wheel contact: a chasing car can climb the tyre ahead and launch. Rigid body only.",
       "default": true,
       "binds": "native"
     },
     {
       "id": "ai_impulse",
       "type": "toggle",
-      "label": "Contact: push AI cars",
-      "description": "On = AI cars take the push too and AI-AI touches count. Off = only your car is pushed (the game's own rule).",
+      "label": "Rigid body: push AI cars",
+      "description": "On = AI cars take the push too and AI-AI touches count. Off = only your car is pushed (the game's own rule). Rigid body only.",
       "default": true,
       "binds": "native"
     },
     {
       "id": "engine_response",
       "type": "choice",
-      "label": "Contact: game's own response",
-      "description": "Add = ours first, the game still fixes overlap (recommended). Ignore = ours only; hard hits can leave cars inside each other.",
+      "label": "Rigid body: game's own response",
+      "description": "Add = the game's own solver pushes the cars apart, so hits cause damage, and we add bounce, friction and the tyre rub (recommended). Ignore = ours only, no damage from car hits. Rigid body only.",
       "values": [
         {
           "value": "add",
@@ -135,40 +153,166 @@
       "binds": "native"
     },
     {
-      "id": "reaction",
+      "id": "contact_spin",
       "type": "choice",
-      "label": "Contact: AI reaction time",
-      "description": "After a hit, the AI car's steering is held where it was before the AI reacts, so the hit can turn the car. Fixed 0.2 / 0.4 / 0.6 s, or scaled: 0.1 s for a light nudge up to 1.0 s for a big hit.",
+      "label": "Classic: AI spin from hits",
+      "description": "Adds the yaw a hit would give an AI car, from where the cars touched and how fast they closed. Light, Medium or Strong. Classic only.",
       "values": [
         {
           "value": "off",
+          "label": "Off"
+        },
+        {
+          "value": "light",
+          "label": "Light"
+        },
+        {
+          "value": "medium",
+          "label": "Medium"
+        },
+        {
+          "value": "strong",
+          "label": "Strong"
+        }
+      ],
+      "default": "strong",
+      "binds": "native"
+    },
+    {
+      "id": "twitch",
+      "type": "choice",
+      "label": "Classic: twitch when hit",
+      "description": "Gives every AI car in a contact at least a small yaw twitch. Needs \"AI spin from hits\" on. Classic only.",
+      "values": [
+        {
+          "value": "off",
+          "label": "Off"
+        },
+        {
+          "value": "small",
+          "label": "Small"
+        },
+        {
+          "value": "medium",
+          "label": "Medium"
+        }
+      ],
+      "default": "medium",
+      "binds": "native"
+    },
+    {
+      "id": "spin_target",
+      "type": "choice",
+      "label": "Classic: who spins",
+      "description": "Which car of a touching pair gets the extra spin: both, only the car behind (the one that hit), or only the car ahead (the one that was hit). Classic only.",
+      "values": [
+        {
+          "value": "both",
+          "label": "Both cars"
+        },
+        {
+          "value": "behind",
+          "label": "Car behind only"
+        },
+        {
+          "value": "ahead",
+          "label": "Car ahead only"
+        }
+      ],
+      "default": "both",
+      "binds": "native"
+    },
+    {
+      "id": "rear_boost",
+      "type": "choice",
+      "label": "Classic: rear hit spins the car ahead",
+      "description": "When the car ahead is hit behind its centre (a hit on the rear tyre), it gets at least this much spin, so a punt from behind can send it round. Classic only.",
+      "values": [
+        {
+          "value": "off",
+          "label": "Off"
+        },
+        {
+          "value": "small",
+          "label": "Small"
+        },
+        {
+          "value": "medium",
+          "label": "Medium"
+        },
+        {
+          "value": "strong",
+          "label": "Strong"
+        }
+      ],
+      "default": "strong",
+      "binds": "native"
+    },
+    {
+      "id": "wheel_lift",
+      "type": "choice",
+      "label": "Classic: wheel-over-wheel lift",
+      "description": "When a tyre rides up on another car, the car behind is lifted at the wheel that touched (a rear-wheel touch lifts the rear). This is the old flying on tyre contact. Classic only.",
+      "values": [
+        {
+          "value": "off",
+          "label": "Off"
+        },
+        {
+          "value": "small",
+          "label": "Small"
+        },
+        {
+          "value": "medium",
+          "label": "Medium"
+        },
+        {
+          "value": "strong",
+          "label": "Strong"
+        }
+      ],
+      "default": "strong",
+      "binds": "native"
+    },
+    {
+      "id": "wheel_push",
+      "type": "choice",
+      "label": "Classic: wheel-to-wheel push",
+      "description": "Touching tyres push the cars apart (the game ships this off, and only pushes your car). Subtle to Extreme; Extreme can throw cars. Classic only.",
+      "values": [
+        {
+          "value": "game",
           "label": "Off (game)"
         },
         {
-          "value": "0.2",
-          "label": "0.2 s"
+          "value": "subtle",
+          "label": "Subtle"
         },
         {
-          "value": "0.4",
-          "label": "0.4 s"
+          "value": "light",
+          "label": "Light"
         },
         {
-          "value": "0.6",
-          "label": "0.6 s"
+          "value": "medium",
+          "label": "Medium"
         },
         {
-          "value": "scaled",
-          "label": "Scales with the hit"
+          "value": "strong",
+          "label": "Strong"
+        },
+        {
+          "value": "extreme",
+          "label": "Extreme"
         }
       ],
-      "default": "scaled",
+      "default": "medium",
       "binds": "native"
     },
     {
       "id": "spin_who",
       "type": "choice",
       "label": "Contact: applies to",
-      "description": "Which touches get the contact physics, the reaction time and punctures: all of them (AI against AI too), or only touches with you.",
+      "description": "Which touches get the contact physics, punctures and the AI's reaction: all of them (AI against AI too), or only touches with you. Both models.",
       "values": [
         {
           "value": "all",
@@ -183,9 +327,87 @@
       "binds": "native"
     },
     {
+      "id": "softening",
+      "type": "choice",
+      "label": "Contact: softening",
+      "description": "The game softens every car-to-car hit with two assists. Off = hits are not softened.",
+      "values": [
+        {
+          "value": "off",
+          "label": "Off (realistic)"
+        },
+        {
+          "value": "game",
+          "label": "Game default"
+        }
+      ],
+      "default": "off",
+      "binds": "native"
+    },
+    {
+      "id": "walls",
+      "type": "toggle",
+      "label": "Walls: wall physics",
+      "description": "Cars scrape along walls (friction) and barriers absorb most of a hit's energy, so a car does not bounce back off a wall like a pinball.",
+      "default": true,
+      "binds": "native"
+    },
+    {
+      "id": "aero_loss",
+      "type": "choice",
+      "label": "Aero: loss when sideways",
+      "description": "Wings only work with air from the front. A car sliding sideways or backwards loses most of its downforce, so spins slide further. Realistic: down to 30 %. Strong: 12 %.",
+      "values": [
+        {
+          "value": "off",
+          "label": "Off"
+        },
+        {
+          "value": "realistic",
+          "label": "Realistic"
+        },
+        {
+          "value": "strong",
+          "label": "Strong"
+        }
+      ],
+      "default": "realistic",
+      "binds": "native"
+    },
+    {
+      "id": "damage_boost",
+      "type": "choice",
+      "label": "Damage: energy-based wing damage",
+      "description": "Hard car-to-car hits add front-wing damage that grows with the energy of the hit (speed squared), on top of the game's own. Rigid body only.",
+      "values": [
+        {
+          "value": "off",
+          "label": "Off"
+        },
+        {
+          "value": "normal",
+          "label": "Normal"
+        },
+        {
+          "value": "high",
+          "label": "High"
+        }
+      ],
+      "default": "normal",
+      "binds": "native"
+    },
+    {
+      "id": "equal_damage",
+      "type": "toggle",
+      "label": "Damage: equal damage for AI cars",
+      "description": "The game gives AI cars a different damage factor than your car. On = every AI car takes the same damage from a hit as your car would (wing, body parts, suspension).",
+      "default": true,
+      "binds": "native"
+    },
+    {
       "id": "puncture",
       "type": "choice",
-      "label": "Contact: tyre punctures",
+      "label": "Damage: tyre punctures",
       "description": "A hit at a tyre can give it a puncture, the more likely the harder the touch (touches under 10 km/h never do, full chance from 60 km/h). Uses the game's own puncture, so the tyre loses air and may burst.",
       "values": [
         {
@@ -211,34 +433,68 @@
     {
       "id": "puncture_you",
       "type": "toggle",
-      "label": "Contact: punctures can hit you",
+      "label": "Damage: punctures can hit you",
       "description": "Off = only AI cars get punctures from contact. On = your tyres too.",
       "default": false,
       "binds": "native"
     },
     {
-      "id": "softening",
+      "id": "jump_break",
       "type": "choice",
-      "label": "Contact: softening",
-      "description": "The game softens every car-to-car hit with two assists. Off = hits are not softened. Ctrl+F9 switches it during a race.",
+      "label": "Damage: suspension after a jump",
+      "description": "A car that flies (over a wheel, a kerb, another car) can land with damaged suspension. Longer flights and harder landings are more likely. Off / Rare / Sometimes / Often.",
       "values": [
         {
           "value": "off",
-          "label": "Off (realistic)"
+          "label": "Off"
         },
         {
-          "value": "game",
-          "label": "Game default"
+          "value": "rare",
+          "label": "Rare"
+        },
+        {
+          "value": "sometimes",
+          "label": "Sometimes"
+        },
+        {
+          "value": "often",
+          "label": "Often"
         }
       ],
-      "default": "off",
+      "default": "sometimes",
       "binds": "native"
     },
     {
-      "id": "osd_message",
+      "id": "jump_damage",
+      "type": "choice",
+      "label": "Damage: jump damage level",
+      "description": "Damage = one corner badly damaged, the car keeps going but handles worse. Break = the corner reaches the game's own breaking point (a wheel can come off).",
+      "values": [
+        {
+          "value": "damage",
+          "label": "Damage"
+        },
+        {
+          "value": "break",
+          "label": "Break"
+        }
+      ],
+      "default": "damage",
+      "binds": "native"
+    },
+    {
+      "id": "jump_you",
       "type": "toggle",
-      "label": "On-screen messages",
-      "description": "Shows on-screen messages in the game's race notification.",
+      "label": "Damage: jumps can damage your car",
+      "description": "Off = only AI cars get suspension damage from jumps. On = your car too.",
+      "default": false,
+      "binds": "native"
+    },
+    {
+      "id": "td_defer",
+      "type": "toggle",
+      "label": "Damage: leave suspension to Terminal Damage",
+      "description": "When the Terminal Damage addon is installed, this addon changes no suspension damage (no jump damage, no AI suspension factors), so Terminal Damage's own suspension model stays in charge.",
       "default": true,
       "binds": "native"
     },

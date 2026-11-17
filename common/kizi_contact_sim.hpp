@@ -65,6 +65,8 @@ inline std::string_view engine_response() { return ::engine_response.get(); }
 inline std::string_view exaggerate() { return ::exaggerate.get(); }
 inline bool tyre_spin() { return ::tyre_spin.get(); }
 inline bool ai_impulse() { return ::ai_impulse.get(); }
+inline bool walls() { return true; }
+inline float damage_boost() { return 0.0f; }
 #endif
 }  // namespace sim::cfg
 #endif
@@ -120,7 +122,7 @@ ApplyImpulseFn g_apply;
 struct Car {
     uint64_t veh = 0, body = 0, wheel[4] = {};
     float invm = 0;
-    V3 pos, com, lin, ang, row[3], up;
+    V3 pos, com, lin, ang, row[3], up, fwd, left;
     bool human = false;
     uint8_t vflag = 0;
 };
@@ -155,7 +157,7 @@ int load_car(uint64_t veh, Car &c)
     if (!mread(c.body + 0x46c, flags) || (flags & 3) == 0 || !mread(veh + 0x130, c.vflag))
         return g_dbg_flags = flags, 3;
     g_dbg_flags = flags, g_dbg_vflag = c.vflag;
-    if (!rd3(c.body + 0x220, c.lin) || !rd3(c.body + 0x210, c.ang) || !rd3(c.body + 0x1c0, c.pos) || !rd3(c.body + 0x1a0, c.up) ||
+    if (!rd3(c.body + 0x220, c.lin) || !rd3(c.body + 0x210, c.ang) || !rd3(c.body + 0x1c0, c.pos) || !rd3(c.body + 0x1a0, c.up) || !rd3(c.body + 0x1b0, c.fwd) || !rd3(c.body + 0x190, c.left) ||
         !mread(c.body + 0x378, comp) || !comp || !rd3(comp, c.com))
         return 4;
     for (int i = 0; i < 3; i++)
@@ -255,11 +257,153 @@ float separation_speed()
 }
 #endif
 
+#if KIZI_SIM_HEAVY
+// --- walls and energy damage (0.7.0, fixed 0.7.2) -----------------------------------------------------------------------
+std::atomic<uint32_t> g_walls{0}, g_wall_absorbed{0}, g_wing_hits{0}, g_wall_skipped{0};
+std::atomic<float> g_wall_vmax{0}, g_wall_sep{0}, g_wing_max{0};
+std::atomic<uint32_t> g_wall_tag{0};               // type tag of the object of the hardest impact (for the log)
+
+// A car against a wall (one side of the contact is not a car). The game's solver still stops the car (so the game's damage
+// works as before); we add what makes a wall feel like a wall instead of a pinball cushion: friction along it, so a car
+// scrapes and loses speed and turns, and energy absorption, so after a hit the car leaves the wall at most at
+// (bounce x 0.5) of its impact speed.
+// 0.7.2, after "a car suddenly stopped": in 0.7.0 non-wall objects counted too (loose car parts, cones, signs: tags 'CAR_',
+// 'PLAS', 'POLY', which the game's own handler treats apart) and the rebound absorption could remove up to 46 m/s at once
+// when the contact normal of a later record pointed another way than the impact's. Now those tags are skipped, the
+// absorption only acts along the impact's own direction (within ~35 degrees), never takes more than 8 m/s or half the
+// impact speed, and the friction never changes the car's speed by more than 2 m/s per record.
+void wall_contact(uint64_t contact, uint64_t veh, uint32_t other_tag)
+{
+    Car C;
+    if (!cfg::walls() || load_car(veh, C) || (cfg::apply_to() == "you" && !C.human))
+        return;
+    if (other_tag == 0x5f524143u || other_tag == 0x53414c50u || other_tag == 0x594c4f50u ||   // CAR_ PLAS POLY
+        other_tag == 0x4c424d52u) {                                                          // RMBL: kerbs (0.7.3)
+        g_wall_skipped++;
+        return;
+    }
+    V3 P, N;
+    if (!rd3(contact + 0x70, P) || !rd3(contact + 0x80, N) || len(N) < 0.5f || len(P - C.pos) > 4.0f)
+        return;
+    N = norm(N);
+    if (std::fabs(N.y) > 0.5f)
+        return;                                    // ground, plank, kerb tops: not a wall
+    V3 n = dot(N, C.com - P) < 0 ? N * -1.0f : N;  // from the wall into the car
+    V3 r = P - C.com;
+    V3 v = point_velocity(C, r);
+    float vn = -dot(v, n);                         // > 0: moving into the wall
+    float k = k_along(C, r, n);
+    if (!(k > 1e-6f) || !std::isfinite(vn))
+        return;
+    g_walls++;
+    struct WallSlot {
+        uint64_t body;
+        float vimp;
+        V3 n;
+        DWORD t;
+    };
+    static WallSlot slots[32];
+    WallSlot &ws = slots[(C.body >> 5) & 31];
+    if (ws.body != C.body || GetTickCount() - ws.t > 400)
+        ws = {C.body, 0.0f, n, GetTickCount()};
+    float x = exaggerate_factor();
+    V3 J{};
+    if (vn > 0.05f) {
+        if (vn > ws.vimp)
+            ws.vimp = vn, ws.n = n;
+        ws.t = GetTickCount();
+        if (vn > g_wall_vmax)
+            g_wall_vmax = vn, g_wall_tag = other_tag;
+        V3 vt = v + n * vn;                        // the part of the speed along the wall
+        float vtl = len(vt);
+        float mu = std::min(0.5f * friction_scale() * x, 1.5f) * std::max(0.5f, 1.0f - vtl / 80.0f);   // carbon on a barrier
+        if (vtl > 1e-3f && mu > 0) {
+            V3 t = vt * (1.0f / vtl);
+            float kt = k_along(C, r, t);
+            if (kt > 1e-6f)
+                J = t * -std::min({vtl / kt, mu * vn / k, 2.0f / kt});
+        }
+    } else if (ws.vimp > 0) {
+        float sep = -vn, allowed = std::min(restitution_value() * 0.5f * x, 0.6f) * ws.vimp;
+        if (sep > allowed + 0.05f && dot(n, ws.n) > 0.82f) {
+            float dv = std::min({sep - allowed, 8.0f, 0.5f * ws.vimp});
+            J = n * (-dv / k);                     // towards the wall: takes the extra rebound away, never pushes into it
+            g_wall_absorbed++;
+            if (sep > g_wall_sep)
+                g_wall_sep = sep;
+        }
+        ws.vimp = 0;
+    }
+    if (finite(J) && len(J) > 0) {
+        alignas(16) float j[4] = {J.x, J.y, J.z, 0};
+        alignas(16) float pt[4] = {P.x, P.y, P.z, 1};
+        g_apply(reinterpret_cast<void *>(C.body), j, pt);
+    }
+}
+
+// Energy-based wing damage for a car-to-car hit. The game's own wing damage is proportional to the solver impulse
+// (research/DAMAGE_RE.md), which grows with the closing speed; real crash damage grows with the energy (speed squared).
+// For a hit in front of a car's front axle we add front-wing damage on that side: impulse-equivalent m_eff x vn x (vn / 5 m/s)
+// (the same as the game's at 5 m/s, four times it at 10 m/s) x DamageScale x the damage level x the strength option, capped
+// at the wing's maximum. Read from / written to the wing component [veh+0x5c8]: +0x28 speed threshold, +0x2c DamageScale,
+// +0x38 maximum per side, +0x40 level, +0x48 / +0x4c left / right damage.
+void wing_energy_damage(const Car &X, V3 P, float vn, float k)
+{
+    float boost = cfg::damage_boost();
+    uint64_t comp = 0;
+    if (boost <= 0 || !mread(X.veh + 0x5c8, comp) || !comp)
+        return;
+    float thr = 0, scale = 0, maxd = 0, level = 0;
+    if (!mread(comp + 0x28, thr) || !mread(comp + 0x2c, scale) || !mread(comp + 0x38, maxd) || !mread(comp + 0x40, level) ||
+        !(vn > thr) || !(scale > 0) || !(maxd > 0) || !(level > 0))
+        return;
+    V3 fwd = norm(X.fwd);
+    float front_axle = -1e9f;
+    for (uint64_t w : X.wheel) {
+        V3 wp;
+        if (rd3(w + 0x2f0, wp))
+            front_axle = std::max(front_axle, dot(wp - X.com, fwd));
+    }
+    if (dot(P - X.com, fwd) < front_axle - 0.1f)
+        return;                                    // not in front of the front axle: not the front wing
+    float d = (vn / k) * (vn / 5.0f) * scale * level * boost;
+    uintptr_t at = comp + (dot(P - X.com, X.left) >= 0 ? 0x48 : 0x4c);
+    float now = 0;
+    if (!std::isfinite(d) || d <= 0 || !mread(at, now))
+        return;
+    float to = std::min(maxd, now + d);
+    if (to > now && mwrite(at, &to, 4)) {
+        g_wing_hits++;
+        if (to - now > g_wing_max)
+            g_wing_max = to - now;
+    }
+}
+#endif
+
+// Cost of our code on the game's physics thread (both hooks: this one and Contact Physics' own on_record), logged every 30 s
+// with the summary so a frame-rate cost would show up in numbers.
+std::atomic<uint64_t> g_cost_ticks{0}, g_cost_calls{0}, g_cost_max{0};
+inline uint64_t qpc()
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return uint64_t(t.QuadPart);
+}
+struct CostTimer {
+    uint64_t t0 = qpc();
+    ~CostTimer()
+    {
+        uint64_t d = qpc() - t0, m = g_cost_max.load();
+        g_cost_ticks += d, g_cost_calls++;
+        while (d > m && !g_cost_max.compare_exchange_weak(m, d)) {
+        }
+    }
+};
+
 // Called on the game's physics thread from the stub, right before the handler returns.
 void on_contact(uint64_t contact)
 {
-    if (!cfg::active())
-        return;                                    // embedded and the host's physics mode is not Realistic
+    CostTimer cost_timer;
     uint64_t last = 0;
     if (!contact || !mread(g_last_slot, last) || last != contact)
         return;                                    // not a live record (the handler's early exit for a repeated record)
@@ -270,6 +414,18 @@ void on_contact(uint64_t contact)
         return;
     }
     uint64_t va = vehicle_of(oa), vb = vehicle_of(ob);
+#if KIZI_SIM_HEAVY
+    if ((va != 0) != (vb != 0)) {                  // one side is not a car: a wall or barrier (or the ground, filtered inside)
+        uint64_t tp = 0;
+        uint32_t other_tag = 0;
+        if (mread(contact + (va ? 0x50 : 0x48), tp) && tp)
+            mread(tp, other_tag);                  // type tag of the object that is not the car
+        wall_contact(contact, va ? va : vb, other_tag);
+        return;
+    }
+#endif
+    if (!cfg::active())
+        return;                                    // embedded and the host's physics mode is Classic: walls only
     if (!va || !vb) {
         g_rej[1]++;
         return;
@@ -369,11 +525,11 @@ void on_contact(uint64_t contact)
         }
         float vn = dot(vrel, n);                   // > 0: approaching
         float x = exaggerate_factor();
-        float e = std::min(restitution_value() * x, 0.8f), vmin = separation_speed();
+        // Bounce depends on the impact speed (0.6.7): a low-speed tap bounces off more, a big hit crumples and keeps less
+        // (x1.6 of the setting at 2 m/s closing speed or less, down to x0.5 at 15 m/s or more).
+        float e_speed = std::clamp(1.6f - (std::max(vn, 0.0f) - 2.0f) * (1.1f / 13.0f), 0.5f, 1.6f);
+        float e = std::min(restitution_value() * x * e_speed, 0.8f), vmin = separation_speed();
         bool keep_engine = cfg::engine_response() != "ignore";
-        if (keep_engine)
-            vmin = 0;                              // the engine still fixes overlap, so no extra push-apart speed
-        float vn_target = -std::max(vmin, vn > 0 ? e * vn : 0.0f);   // wanted normal speed afterwards (separating)
         float k = k_along(A, rA, n) + k_along(B, rB, n);
         s.vn = vn;
         bool step_full = false;
@@ -392,22 +548,59 @@ void on_contact(uint64_t contact)
             if (step_full)
                 g_step_capped++;
         }
-        if (!step_full && vn > vn_target + (keep_engine ? 0.02f : 0.0f) && k > 1e-6f && std::isfinite(vn)) {
-            float dv = std::min(vn - vn_target, 40.0f);       // never change the closing speed by more than 40 m/s per record
-            float j = dv / k;
+        // 0.6.3, "Add": the game's own solver does the normal push of a hit. Its impulse is what the damage system reads
+        // (research/DAMAGE_RE.md: damage = solver impulse x DamageScale x level), so we no longer stop the cars ourselves
+        // before it runs (0.6.0 - 0.6.2 did, the solver saw separating cars and car-to-car hits did almost no damage).
+        // We add what the solver does not: the bounce (one step later, once the solver has stopped the closing speed) and
+        // the friction / rolling-tyre rub, limited by the load the solver is about to apply. "Ignore" is unchanged: our own
+        // full impulse and the solver told to skip the contact.
+        struct BounceSlot {
+            uint64_t a, b;
+            float v;
+            DWORD t;
+        };
+        static BounceSlot bounces[64];
+        BounceSlot &bs = bounces[((A.body >> 5) ^ (B.body >> 7)) & 63];
+        if (bs.a != A.body || bs.b != B.body || GetTickCount() - bs.t > 250)
+            bs = {A.body, B.body, 0.0f, GetTickCount()};
+        float dv = 0, jn = 0, load = 0;            // our speed change along n, our normal impulse, the load friction may use
+        if (!step_full && k > 1e-6f && std::isfinite(vn)) {
+            if (keep_engine) {
+                if (vn > 0.02f) {
+                    if (bs.v <= 0) {               // first closing record of this hit: energy-based wing damage, once
+                        wing_energy_damage(A, P, vn, k);
+                        wing_energy_damage(B, P, vn, k);
+                    }
+                    load = vn / k;                 // about the impulse the solver applies in this step
+                    bs.v = std::max(bs.v, std::min(e * vn, 40.0f)), bs.t = GetTickCount();
+                } else if (bs.v > 0) {
+                    dv = bs.v + vn;                // vn <= 0: the cars already separate at -vn; top up to the bounce
+                    bs.v = 0;
+                    if (dv > 0.01f)
+                        jn = dv / k;
+                }
+            } else {
+                float vn_target = -std::max(vmin, vn > 0 ? e * vn : 0.0f);   // wanted normal speed afterwards
+                if (vn > vn_target) {
+                    dv = std::min(vn - vn_target, 40.0f);   // never more than 40 m/s per record
+                    jn = load = dv / k;
+                }
+            }
+        }
+        if (jn > 0 || load > 0) {
             V3 vt = vrel - n * vn;
-            // hot racing slicks on rubber 1.8, carbon bodies 0.6 (0.0.8: the textbook 1.0 / 0.3 felt like nothing in tests, part of
-            // each push is lost because the engine also handles the contact)
+            // hot racing slicks on rubber 1.8, carbon bodies 0.6 (0.0.8: the textbook 1.0 / 0.3 felt like nothing in tests)
             float vtl = len(vt), jt = 0, mu = std::min((tyre ? 1.8f : 0.6f) * friction_scale() * x, 3.0f);
+            mu *= std::max(0.5f, 1.0f - vtl / 80.0f);   // rubber grips less the faster it slides (0.6.7): half at 40 m/s
             V3 t{};
-            if (vtl > 1e-3f && mu > 0) {
+            if (vtl > 1e-3f && mu > 0 && load > 0) {
                 t = vt * (1.0f / vtl);
                 float kt = k_along(A, rA, t) + k_along(B, rB, t);
                 if (kt > 1e-6f)
-                    jt = std::min(vtl / kt, mu * j);
+                    jt = std::min(vtl / kt, mu * load);
             }
-            V3 J = n * j + t * jt;                 // impulse that acts on B; A gets the opposite
-            if (finite(J)) {
+            V3 J = n * jn + t * jt;                // impulse that acts on B; A gets the opposite
+            if (finite(J) && (jn > 0 || jt > 0)) {
                 alignas(16) float ja[4] = {-J.x, -J.y, -J.z, 0}, jb[4] = {J.x, J.y, J.z, 0};
                 alignas(16) float pt[4] = {P.x, P.y, P.z, 1};
                 bool push_a = !flag_rule || (A.vflag & 8), push_b = !flag_rule || (B.vflag & 8);
@@ -418,24 +611,17 @@ void on_contact(uint64_t contact)
                 if (push_b)
                     g_apply(reinterpret_cast<void *>(B.body), jb, pt);
                 g_applied++;
-                s.delta_v = dv, s.vt = vtl, s.mu_used = mu;
+                s.delta_v = std::max(dv, vn), s.vt = vtl, s.mu_used = mu;
                 float lift = std::fabs(J.y) * std::max(A.invm, B.invm);   // vertical speed change of the lighter side (m/s)
                 s.lift = lift;
                 if (lift > g_max_lift)
                     g_max_lift = lift;
-                if (dv > g_max_dv)
-                    g_max_dv = dv;
-                if (!keep_engine) {
-                    uint8_t f = 0;
-                    if (mread(contact + 0x32, f)) {
-                        f |= 1;
-                        mwrite(contact + 0x32, &f, 1);
-                        g_ignored++;
-                    }
-                }
+                if (s.delta_v > g_max_dv)
+                    g_max_dv = s.delta_v;
             }
-        } else if (std::isfinite(vn) && k > 1e-6f && cfg::engine_response() == "ignore") {
-            uint8_t f = 0;                         // already separating: nothing to push, the engine must not pull either
+        }
+        if (!keep_engine && std::isfinite(vn) && k > 1e-6f) {
+            uint8_t f = 0;                         // ours only: the engine must not push or pull this contact
             if (mread(contact + 0x32, f)) {
                 f |= 1;
                 mwrite(contact + 0x32, &f, 1);
@@ -566,6 +752,22 @@ void worker()
                             g_seen.exchange(0), g_carcar.exchange(0), g_tyre.exchange(0), g_rewritten.exchange(0),
                             g_applied.exchange(0), g_ignored.exchange(0), g_max_dv.exchange(0), g_max_ny.exchange(0),
                             g_spin_touches.exchange(0), double(g_max_lift.exchange(0)), g_step_capped.exchange(0));
+#if KIZI_SIM_HEAVY
+            if (g_walls.load() || g_wing_hits.load())
+                swofty::log(SIM_TAG " walls, last 30 s: %u record(s), hardest impact %.1f m/s (object %s), %u rebound(s) absorbed "
+                            "(fastest %.1f m/s), %u loose part / cone / sign / kerb contact(s) skipped | energy wing damage: %u hit(s), largest %.3f",
+                            g_walls.exchange(0), double(g_wall_vmax.exchange(0)), tag_text(g_wall_tag.exchange(0)).c_str(),
+                            g_wall_absorbed.exchange(0), double(g_wall_sep.exchange(0)), g_wall_skipped.exchange(0),
+                            g_wing_hits.exchange(0), double(g_wing_max.exchange(0)));
+#endif
+            if (g_cost_calls.load()) {
+                LARGE_INTEGER f;
+                QueryPerformanceFrequency(&f);
+                double ms = double(g_cost_ticks.exchange(0)) * 1000.0 / double(f.QuadPart);
+                swofty::log(SIM_TAG " cost on the physics thread, last 30 s: %.2f ms per second (%.3f %% of a core), %llu calls, "
+                            "longest %.0f us", ms / 30.0, ms / 300.0, (unsigned long long)g_cost_calls.exchange(0),
+                            double(g_cost_max.exchange(0)) * 1e6 / double(f.QuadPart));
+            }
         }
     }
 }

@@ -89,27 +89,80 @@ template <class F> inline void each_heap_chunk(F fn)
     }
 }
 
-// Allocate a small executable block within +-2 GB of `target_addr` (so a rel32 call can reach it).
-inline uint8_t *alloc_near(uintptr_t target_addr, size_t size)
+// Reserve and commit `size` executable bytes in a free region within +-2 GB of `target_addr` (so a rel32 call or jump can
+// reach it). One VirtualQuery per REGION, not per 64 KB granule: until 0.8.1 this stepped 64 KB at a time, which in a
+// crowded address space (many addons) took 100k+ queries and stalled the game on launch for about a minute.
+inline uint8_t *alloc_region_near(uintptr_t target_addr, size_t size)
 {
     const uintptr_t gran = 0x10000, reach = 0x7FF00000;
-    for (int dir = -1; dir <= 1; dir += 2) {
-        uintptr_t a = dir < 0 ? (image_base() & ~(gran - 1)) - gran
-                              : ((image_base() + image_size() + gran - 1) & ~(gran - 1));
-        while ((dir < 0 ? target_addr - a : a - target_addr) < reach && a > gran) {
+    auto in_reach = [&](uintptr_t p) {
+        uintptr_t lo = p < target_addr ? target_addr - p : p - target_addr;
+        uintptr_t hi = p + size < target_addr ? target_addr - (p + size) : p + size - target_addr;
+        return lo < reach && hi < reach;
+    };
+    static uintptr_t hint[2];                      // where the last free space was found, per direction
+    for (int dir = 0; dir < 2; dir++) {            // 0 = down from the image, 1 = up from its end
+        if (hint[dir] && !in_reach(hint[dir]))
+            hint[dir] = 0;
+        uintptr_t a = hint[dir] ? hint[dir]
+                      : dir == 0 ? (image_base() & ~(gran - 1)) - 1
+                                 : (image_base() + image_size() + gran - 1) & ~(gran - 1);
+        for (int guard = 0; guard < (1 << 16) && a > gran && a < 0x7FFFFFFF0000ull; guard++) {
             MEMORY_BASIC_INFORMATION m;
             if (!VirtualQuery(reinterpret_cast<void *>(a), &m, sizeof m))
                 break;
-            if (m.State == MEM_FREE) {
-                void *p = VirtualAlloc(reinterpret_cast<void *>(a), size, MEM_RESERVE | MEM_COMMIT,
-                                       PAGE_EXECUTE_READWRITE);
-                if (p)
-                    return static_cast<uint8_t *>(p);
+            uintptr_t base = reinterpret_cast<uintptr_t>(m.BaseAddress), end = base + m.RegionSize;
+            if (m.State == MEM_FREE && end - base >= size) {
+                uintptr_t p = dir == 0 ? (end - size) & ~(gran - 1) : (base + gran - 1) & ~(gran - 1);
+                if (p >= base && p + size <= end && in_reach(p))
+                    if (void *r = VirtualAlloc(reinterpret_cast<void *>(p), size, MEM_RESERVE | MEM_COMMIT,
+                                               PAGE_EXECUTE_READWRITE)) {
+                        hint[dir] = dir == 0 ? p - 1 : p + ((size + gran - 1) & ~(gran - 1));
+                        return static_cast<uint8_t *>(r);
+                    }
             }
-            a = dir < 0 ? a - gran : a + gran;
+            if (dir == 0) {
+                uintptr_t below = m.State == MEM_FREE ? base : reinterpret_cast<uintptr_t>(m.AllocationBase);
+                if (below <= gran || !in_reach(below - 1))
+                    break;
+                a = below - 1;
+            } else {
+                if (!in_reach(end))
+                    break;
+                a = end;
+            }
         }
     }
     return nullptr;
+}
+
+// Executable memory within +-2 GB of `target_addr`. Small requests share one 64 KB block per DLL (one search for all of
+// a DLL's stubs); larger ones get a region of their own.
+inline uint8_t *alloc_near(uintptr_t target_addr, size_t size)
+{
+    const size_t pool_size = 0x10000;
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static uint8_t *pool;
+    static size_t used;
+    size = (size + 63) & ~size_t(63);
+    if (size > pool_size / 2)
+        return alloc_region_near(target_addr, size);
+    AcquireSRWLockExclusive(&lock);
+    auto ok = [&](uintptr_t p) {
+        uintptr_t d1 = p < target_addr ? target_addr - p : p - target_addr;
+        uintptr_t d2 = p + size < target_addr ? target_addr - (p + size) : p + size - target_addr;
+        return d1 < 0x7FF00000 && d2 < 0x7FF00000;
+    };
+    if (!pool || used + size > pool_size || !ok(reinterpret_cast<uintptr_t>(pool + used))) {
+        uint8_t *fresh = alloc_region_near(target_addr, pool_size);
+        if (fresh)
+            pool = fresh, used = 0;
+    }
+    uint8_t *r = nullptr;
+    if (pool && used + size <= pool_size && ok(reinterpret_cast<uintptr_t>(pool + used)))
+        r = pool + used, used += size;
+    ReleaseSRWLockExclusive(&lock);
+    return r;
 }
 
 // Point the `call rel32` at `site` to `target` through a 14-byte absolute-jump stub. Returns the old callee, or 0.

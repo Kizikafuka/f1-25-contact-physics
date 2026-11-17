@@ -13,9 +13,10 @@
 // The game copies these values from its database when the collision system starts, possibly after this plugin
 // loads, so a worker re-applies the chosen state about once a second.
 //
-// Hotkeys (game window focused): Ctrl+F9 softening on/off, Ctrl+F10 cycles the wheel-to-wheel push (Classic only). Each beeps;
+// No hotkeys since 0.6.6 (Ctrl+F9 softening / Ctrl+F10 wheel push removed); everything is set in the addon settings.
 // a message also shows in the game's race notification.
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -26,25 +27,33 @@
 #include <string_view>
 #include <thread>
 #include "kizi_mem.hpp"
+#include <swofty/events.hpp>
+#include <swofty/systems/cars.hpp>
 #include "osd.hpp"
 
 SWOFTY_SETTING(std::string_view, softening, "off");
 SWOFTY_SETTING(std::string_view, wheel_push, "medium");
-SWOFTY_SETTING(bool, osd_message, true);
 SWOFTY_SETTING(bool, contact_log, false);
 SWOFTY_SETTING(std::string_view, contact_spin, "strong");
 SWOFTY_SETTING(std::string_view, spin_who, "all");
-SWOFTY_SETTING(std::string_view, reaction, "scaled");
 SWOFTY_SETTING(std::string_view, twitch, "medium");
 SWOFTY_SETTING(std::string_view, spin_target, "both");
 SWOFTY_SETTING(std::string_view, rear_boost, "strong");
 SWOFTY_SETTING(std::string_view, wheel_lift, "strong");
 SWOFTY_SETTING(std::string_view, puncture, "sometimes");
 SWOFTY_SETTING(bool, puncture_you, false);
-// Physics mode. 0.6.1: the rigid-body response of common/kizi_contact_sim.hpp (impulse from both cars' mass and inertia at the
-// contact point, bounce, friction, rolling tyres rubbing, AI cars pushed too) is THE contact physics; the option is no longer
-// in the menu, so this default always applies. "classic" (the made-up spin / twitch / rear-hit / lift / wheel push below,
-// 0.5.x behaviour) is kept in the code only so it can come back by re-adding the option.
+SWOFTY_SETTING(std::string_view, jump_break, "sometimes");
+SWOFTY_SETTING(std::string_view, jump_damage, "damage");
+SWOFTY_SETTING(bool, jump_you, false);
+SWOFTY_SETTING(bool, equal_damage, true);
+SWOFTY_SETTING(bool, td_defer, true);
+SWOFTY_SETTING(bool, walls, true);
+SWOFTY_SETTING(std::string_view, damage_boost, "normal");
+SWOFTY_SETTING(std::string_view, aero_loss, "realistic");
+// Physics mode ("Physics: contact model"). "realistic" = Rigid body: the response of common/kizi_contact_sim.hpp (impulse from
+// both cars' mass and inertia at the contact point, bounce, friction, rolling tyres rubbing, AI cars pushed too); the only
+// model in 0.6.1 - 0.7.3. "classic" = the 0.5.x contact (the spin / twitch / rear-hit / lift / wheel push below), back as a
+// choice in 0.8.0 because players missed the flying on tyre contact. Walls, aero loss and damage work with both.
 SWOFTY_SETTING(std::string_view, physics_mode, "realistic");
 SWOFTY_SETTING(std::string_view, exaggerate, "off");
 SWOFTY_SETTING(std::string_view, restitution, "medium");
@@ -65,6 +74,12 @@ inline std::string_view engine_response() { return ::engine_response.get(); }
 inline std::string_view exaggerate() { return ::exaggerate.get(); }
 inline bool tyre_spin() { return ::tyre_spin.get(); }
 inline bool ai_impulse() { return ::ai_impulse.get(); }
+inline bool walls() { return ::walls.get(); }
+inline float damage_boost()
+{
+    std::string_view v = ::damage_boost.get();
+    return v == "normal" ? 1.0f : v == "high" ? 2.0f : 0.0f;
+}
 }  // namespace sim::cfg
 #define KIZI_SIM_EMBED 1
 #define KIZI_SIM_HEAVY 1
@@ -555,104 +570,24 @@ uint64_t body_of(uint64_t veh)
                : 0;
 }
 
-// --- AI reaction time ------------------------------------------------------------------------------------------
-// Every car has a ControllerSet (+0x28 its AI controller). Each frame the AI controller's update (vtable slot 1)
-// copies the AI's decision for car [ctrl+0x18] into the car's input record [ctrl+8]: +0x0c throttle, +0x14 steering,
-// +0x18 brake (read live). All AI controllers get a copy of their vtable whose slot 1 calls the game's update and then,
-// while that car is "stunned" after a hit, puts the steering back to what it was at the hit - the driver has not
-// reacted yet, so the car turns with the hit instead of being caught on the same frame.
-uintptr_t g_sets_global;                           // ControllerSet manager pointer
-uint8_t g_sets_vec;                                // manager + this = vector of ControllerSet*
-using CtrlUpdate = uint64_t (*)(void *);
-CtrlUpdate g_ctrl_update;
-uint64_t *g_ctrl_vt;                               // our vtable copy (slot 0 at index 1; index 0 = RTTI locator)
-uintptr_t g_ctrl_vt_orig;
-struct Stun {
-    std::atomic<DWORD> until{0};
-    std::atomic<float> steer{0};
-};
-Stun g_stun[32];
-std::atomic<int> g_stuns{0};
-
-uint64_t ctrl_update_hook(void *self)
+// --- AI reaction after a hit (in AI Driver Behaviour since 0.8.0) ---------------------------------------------------
+// How the AI drives (its reaction after a hit and to a slide) is AI Driver Behaviour's job from 0.8.0 (its 0.2.0); this
+// addon only finds the hits and tells it, through the function that DLL exports. Without that addon: no reaction hold.
+using AiHitFn = void (*)(int idx, float impact);
+std::atomic<AiHitFn> g_ai_hit{nullptr};
+void find_ai_hit()
 {
-    uint64_t r = g_ctrl_update(self);
-    auto c = static_cast<uint8_t *>(self);
-    uint8_t idx = c[0x18];
-    if (idx < 32 && g_stun[idx].until.load() && int(g_stun[idx].until.load() - GetTickCount()) > 0)
-        if (auto out = *reinterpret_cast<uint8_t **>(c + 8))
-            *reinterpret_cast<float *>(out + 0x14) = g_stun[idx].steer;
-    return r;
+    if (!g_ai_hit.load())
+        if (HMODULE m = GetModuleHandleA("kizi_ai_driver_behaviour.dll"))
+            if (auto f = reinterpret_cast<AiHitFn>(GetProcAddress(m, "kizi_ai_hit"))) {
+                g_ai_hit = f;
+                swofty::log("[ai-tweaks] AI reaction after a hit: handled by AI Driver Behaviour");
+            }
 }
-
-// How long the AI keeps its steering after a hit. Fixed (0.2 / 0.4 / 0.6 s), or "scaled": a light nudge is caught almost at
-// once and a big hit takes longer, from 0.1 s at a closing speed of 1 m/s or less to 1.0 s at 10 m/s or more (smooth curve).
-DWORD reaction_ms(float impact)
-{
-    std::string_view v = reaction.get();
-    if (v == "scaled") {
-        float t = std::clamp((impact - 1.0f) / 9.0f, 0.0f, 1.0f);
-        return DWORD(100.0f + 900.0f * t * t * (3.0f - 2.0f * t));
-    }
-    return v == "0.2" ? 200 : v == "0.4" ? 400 : v == "0.6" ? 600 : 0;
-}
-std::atomic<uint32_t> g_stun_ms_sum{0}, g_stun_ms_max{0};
-std::atomic<float> g_impact_max{0};
-
-// The AI controller of car idx, or 0.
-uintptr_t ai_ctrl(int idx)
-{
-    uint64_t mgr = 0, b = 0, e = 0, set = 0, ai = 0;
-    if (!g_sets_global || idx < 0 || !kizi::read(g_sets_global, mgr) || !mgr || !kizi::read(mgr + g_sets_vec, b) ||
-        !kizi::read(mgr + g_sets_vec + 8, e) || b + 8 * idx >= e || !kizi::read(b + 8 * idx, set) || !set ||
-        !kizi::read(set + 0x28, ai))
-        return 0;
-    return ai;
-}
-
-// Put our vtable on every AI controller that still has the game's (new sessions make new controllers).
-void wrap_controllers()
-{
-    for (int i = 0; i < 32; i++) {
-        uintptr_t ai = ai_ctrl(i);
-        uint64_t vt = 0;
-        if (!ai || !kizi::read(ai, vt) || !vt)
-            continue;
-        if (!g_ctrl_vt) {                          // first controller: make the copy from its vtable
-            uint64_t slot1 = 0;
-            if (!kizi::in_image(vt) || !kizi::read(vt + 8, slot1) || !kizi::in_image(slot1))
-                return;
-            auto copy = new uint64_t[17];
-            if (!kizi::read(vt - 8, copy, 17 * 8))
-                return;
-            g_ctrl_update = reinterpret_cast<CtrlUpdate>(slot1);
-            copy[2] = reinterpret_cast<uint64_t>(&ctrl_update_hook);
-            g_ctrl_vt_orig = vt, g_ctrl_vt = copy;
-        }
-        if (vt == g_ctrl_vt_orig) {
-            uint64_t nv = reinterpret_cast<uint64_t>(g_ctrl_vt + 1);
-            kizi::write(ai, &nv, 8);
-        }
-    }
-}
-
 void stun(int idx, float impact)
 {
-    DWORD ms = reaction_ms(impact);
-    uintptr_t ai = ms ? ai_ctrl(idx) : 0;
-    uint64_t out = 0;
-    float steer = 0;
-    if (!ai || idx >= 32 || !kizi::read(ai + 8, out) || !out || !kizi::read(out + 0x14, steer))
-        return;
-    if (!g_stun[idx].until.load() || int(g_stun[idx].until.load() - GetTickCount()) <= 0)
-        g_stun[idx].steer = steer;                 // a new stun freezes the steering of this moment
-    g_stun[idx].until = GetTickCount() + ms;
-    g_stuns++;
-    g_stun_ms_sum += ms;
-    if (ms > g_stun_ms_max)
-        g_stun_ms_max = ms;
-    if (impact > g_impact_max)
-        g_impact_max = impact;
+    if (AiHitFn f = g_ai_hit.load(); f && idx >= 0)
+        f(idx, impact);
 }
 
 constexpr DWORD HOLD_MS = 250;
@@ -676,6 +611,7 @@ std::map<std::pair<uint64_t, uint64_t>, DWORD> g_seen;   // pair -> last record 
 // own thread between steps. The hold below then keeps it alive while the AI tries to correct.
 void on_record(uint64_t contact, uint64_t a, uint64_t b)
 {
+    sim::CostTimer cost_timer;                     // counted with the contact physics' own cost (logged every 30 s)
     if (!a || !b)
         return;
     float level = spin_level();
@@ -813,10 +749,12 @@ void on_record(uint64_t contact, uint64_t a, uint64_t b)
 // Keeps each extra spin alive while it fades (the AI counter-steers within a few physics steps).
 void spin_worker()
 {
+    bool idle = true;
     for (;;) {
-        Sleep(1);
+        Sleep(idle ? 25 : 1);                      // 1 ms only while a Classic spin is being held (never in the default physics)
         DWORD t = GetTickCount();
         std::lock_guard<std::mutex> lock(g_spin_mx);
+        idle = g_holds.empty();
         for (auto it = g_holds.begin(); it != g_holds.end();) {
             DWORD age = t - it->start;
             if (age >= HOLD_MS) {
@@ -831,31 +769,363 @@ void spin_worker()
     }
 }
 
-std::string upper(std::string s)
+// --- aero loss when sideways (0.7.0) ------------------------------------------------------------------------------------
+// An F1 car's wings and floor only work with the air coming from the front: sideways or backwards most of the downforce is
+// gone, which is why a spinning car slides so far. The worker measures every car's slip angle (between where it points and
+// where it goes, on the ground plane) at 20 Hz; above 15 degrees and 12 m/s the car's downforce multiplier (the game's own
+// F1Aero lift_scale, through Swofty's live car field aero_lift_scale) is lowered smoothly to the option's floor at 90 degrees
+// and more, and put back when the car points where it goes again. Reading happens on the worker thread, setting the field on
+// the game's frame thread.
+namespace live = swofty::cars::live;
+
+float aero_floor()
 {
-    for (auto &c : s)
-        c = char(toupper(uint8_t(c)));
-    return s;
+    std::string_view v = aero_loss.get();
+    return v == "realistic" ? 0.3f : v == "strong" ? 0.12f : 1.0f;
+}
+
+std::atomic<float> g_aero_want[32];
+float g_aero_applied[32], g_aero_base[32];
+uint64_t g_aero_veh[32], g_aero_body[32];
+std::atomic<bool> g_aero_disabled{false};
+std::atomic<int> g_aero_lowered{0};
+std::atomic<float> g_aero_min{1.0f};
+std::atomic<int> g_aero_wanted{0}, g_aero_refused{0};
+std::atomic<float> g_aero_beta_max{0};
+int g_aero_last_result = -1;
+
+void aero_compute()
+{
+    if (!g_vehicles || g_aero_disabled)
+        return;
+    float floor = aero_floor();
+    for (int i = 0; i < 32; i++) {
+        uint64_t veh = 0;
+        float want = 1.0f;
+        if (floor < 1.0f && kizi::read(g_vehicles + i * 8, veh) && veh) {
+            if (g_aero_body[i] == 0 || g_aero_veh[i] != veh)
+                g_aero_veh[i] = veh, g_aero_body[i] = body_of(veh);
+            float b[0x9c / 4] = {};                // body +0x190 .. +0x22c: left, up, fwd .. velocity
+            if (g_aero_body[i] && kizi::read(g_aero_body[i] + 0x190, b, sizeof b)) {
+                V3 up{b[4], b[5], b[6]}, fwd{b[8], b[9], b[10]}, vel{b[(0x220 - 0x190) / 4], b[(0x224 - 0x190) / 4],
+                                                                     b[(0x228 - 0x190) / 4]};
+                float ul = len(up);
+                if (ul > 0.5f) {
+                    up = {up.x / ul, up.y / ul, up.z / ul};
+                    float vu = dot(vel, up), fu = dot(fwd, up);
+                    V3 vh{vel.x - up.x * vu, vel.y - up.y * vu, vel.z - up.z * vu};
+                    V3 fh{fwd.x - up.x * fu, fwd.y - up.y * fu, fwd.z - up.z * fu};
+                    float sp = len(vh), fl = len(fh);
+                    if (sp > 12.0f && fl > 0.3f) {
+                        float c = std::clamp(dot(vh, fh) / (sp * fl), -1.0f, 1.0f);
+                        float beta = std::acos(c) * 57.2958f;          // slip angle, 0 .. 180 degrees
+                        float t = std::clamp((beta - 15.0f) / 75.0f, 0.0f, 1.0f);
+                        want = floor < 1.0f ? 1.0f - (1.0f - floor) * t * t * (3.0f - 2.0f * t) : 1.0f;
+                        if (beta > g_aero_beta_max)
+                            g_aero_beta_max = beta;
+                        if (want < 1.0f && g_aero_want[i].load() == 1.0f)
+                            g_aero_wanted++;       // a slide starts (counted even if the field can't be set)
+                    }
+                }
+            } else
+                g_aero_body[i] = 0;
+        }
+        g_aero_want[i] = want;
+    }
+}
+
+void aero_frame(double, void *)
+{
+    static double acc = 0;
+    static bool checked = false;
+    acc += 1.0 / 60.0;                             // the frame tick passes dt; a fixed step is enough for a 20 Hz rate
+    if (acc < 0.05 || g_aero_disabled || !g_vehicles)
+        return;
+    acc = 0;
+    if (!live::available())
+        return;
+    if (!checked) {                                // the live car index must be our vehicle table index (checked once cars exist)
+        int match = 0, have = 0;
+        for (const auto &c : live::cars()) {
+            uint64_t v = 0;
+            if (!c.handle() || c.index() >= 32 || !kizi::read(g_vehicles + c.index() * 8, v))
+                continue;
+            have++;
+            match += reinterpret_cast<uint64_t>(c.handle()) == v;
+        }
+        if (!have)
+            return;                                // no cars yet (menus): check again next time
+        checked = true;
+        swofty::log("[ai-tweaks] aero loss: live car handles %d of %d match the vehicle table", match, have);
+        if (have && !match) {
+            swofty::log("[ai-tweaks] aero loss: car index mapping unknown - not used");
+            g_aero_disabled = true;
+            return;
+        }
+    }
+    for (int i = 0; i < 32; i++) {
+        float want = g_aero_want[i];
+        float &applied = g_aero_applied[i];
+        if (applied == 0)
+            applied = 1.0f;
+        if (std::fabs(want - applied) < 0.04f && !(want == 1.0f && applied != 1.0f))
+            continue;
+        live::Car car{static_cast<uint32_t>(i)};
+        if (applied == 1.0f) {                     // start of a slide: remember the car's own value
+            auto b = car.get(live::Field::aero_lift_scale);
+            if (!b) {
+                static bool told = false;
+                if (!told)
+                    told = true, swofty::log("[ai-tweaks] aero loss: car %d, reading aero_lift_scale failed (will retry)", i);
+                continue;
+            }
+            g_aero_base[i] = *b;
+        }
+        float val = want == 1.0f ? g_aero_base[i] : g_aero_base[i] * want;
+        swofty::Result r = car.set(live::Field::aero_lift_scale, val);
+        if (r == swofty::Result::ok) {
+            if (want < 1.0f && applied == 1.0f)
+                g_aero_lowered++;
+            if (want < g_aero_min)
+                g_aero_min = want;
+            applied = want;
+        } else if (int(r) != g_aero_last_result) {
+            g_aero_last_result = int(r);
+            g_aero_refused++;
+            swofty::log("[ai-tweaks] aero loss: car %d, setting aero_lift_scale to %.3f was refused (%s)", i, val, swofty::result_name(r));
+        }
+        if (r == swofty::Result::unavailable || r == swofty::Result::invalid) {
+            swofty::log("[ai-tweaks] aero loss: the core refused aero_lift_scale (%s) - not used", swofty::result_name(r));
+            g_aero_disabled = true;
+            return;
+        }
+    }
+}
+
+// --- Terminal Damage and equal damage ------------------------------------------------------------------------------------
+// Terminal Damage (nick.terminal-damage-probe) has its own suspension model ("Suspension damage from hits") that replaces the
+// game's suspension damage. With "leave suspension to Terminal Damage" on and its DLL loaded, this addon writes no suspension
+// damage of its own (no jump damage, no suspension factors for AI cars).
+bool td_owns_suspension()
+{
+    return td_defer.get() && GetModuleHandleA("terminal_damage_probe.dll") != nullptr;
+}
+
+// The game applies its damage setting with a different factor for your car and for AI cars (research/DAMAGE_RE.md,
+// 0x142f182e0, vehicle flag bit 3): wing component +0x40/+0x44, suspension component +0x128/+0x12c, each body part +0x50/+0x54.
+// "Equal damage" copies your car's factors onto every AI car (re-checked every 2 s, the game sets them again per session),
+// so an AI car takes as much damage from a hit as your car would.
+int g_equal_logged = -1;
+void equal_damage_tick()
+{
+    if (!g_vehicles || !equal_damage.get())
+        return;
+    uint64_t me = 0;
+    for (int i = 0; i < 32 && !me; i++) {
+        uint64_t v = 0;
+        if (kizi::read(g_vehicles + i * 8, v) && v && human(v))
+            me = v;
+    }
+    uint64_t my_wing = 0, my_susp = 0, my_body = 0, pb = 0, pe = 0;
+    if (!me || !kizi::read(me + 0x5c8, my_wing) || !kizi::read(me + 0x5d0, my_susp) || !kizi::read(me + 0x5e0, my_body))
+        return;
+    float wing[2] = {}, susp[2] = {};
+    bool have_wing = my_wing && kizi::read(my_wing + 0x40, wing, 8);
+    bool have_susp = my_susp && kizi::read(my_susp + 0x128, susp, 8) && !td_owns_suspension();
+    std::vector<std::array<float, 2>> parts;
+    if (my_body && kizi::read(my_body + 0x58, pb) && kizi::read(my_body + 0x60, pe) && pb && pe > pb && (pe - pb) / 0x60 <= 64)
+        for (uint64_t p = pb; p < pe; p += 0x60) {
+            std::array<float, 2> f{};
+            if (!kizi::read(p + 0x50, f.data(), 8))
+                break;
+            parts.push_back(f);
+        }
+    int changed = 0;
+    for (int i = 0; i < 32; i++) {
+        uint64_t v = 0, c = 0, b = 0, e = 0;
+        if (!kizi::read(g_vehicles + i * 8, v) || !v || v == me || human(v))
+            continue;
+        bool any = false;
+        auto put = [&](uint64_t at, const float *want) {
+            float now[2] = {};
+            if (kizi::read(at, now, 8) && (now[0] != want[0] || now[1] != want[1]) && kizi::write(at, want, 8))
+                any = true;
+        };
+        if (have_wing && kizi::read(v + 0x5c8, c) && c)
+            put(c + 0x40, wing);
+        if (have_susp && kizi::read(v + 0x5d0, c) && c)
+            put(c + 0x128, susp);
+        if (!parts.empty() && kizi::read(v + 0x5e0, c) && c && kizi::read(c + 0x58, b) && kizi::read(c + 0x60, e) && b && e > b &&
+            (e - b) / 0x60 == parts.size())    // same body part list as your car (same car model): copy part by part
+            for (size_t k = 0; k < parts.size(); k++)
+                put(b + k * 0x60 + 0x50, parts[k].data());
+        changed += any;
+    }
+    if (changed && changed != g_equal_logged) {
+        swofty::log("[ai-tweaks] equal damage: %d AI car(s) set to your car's damage factors (wing %.3g/%.3g, suspension %s, "
+                    "%zu body parts)", changed, wing[0], wing[1], have_susp ? "yes" : "left to Terminal Damage", parts.size());
+        g_equal_logged = changed;
+    }
+}
+
+// --- suspension after a jump ---------------------------------------------------------------------------------------------
+// A car that flies (launched over a wheel, a kerb, another car) can land with broken suspension. The worker watches every
+// car's vertical speed (body +0x224) at 20 Hz: free fall (vertical acceleration about -g or less for 0.15 s) means the car is
+// in the air; ground forces again mean it landed. After a flight of at least 0.3 s a chance roll decides whether one corner
+// is damaged (longer flights and harder landings are more likely). The damage goes where the game keeps it
+// (research/DAMAGE_RE.md): the F1SuspensionDamage component [vehicle+0x5d0], counters rear L/R +0x130/+0x134 and front L/R
+// +0x138/+0x13c. The game treats a corner as broken (its own getters 0x144655530..0x144655590) once the counter reaches the
+// threshold it keeps XOR-scrambled at +0x58 ^ +0x60; "Damage" puts the corner at 70-95 % of that (the car keeps going,
+// damaged), "Break" at the threshold.
+float jump_chance()
+{
+    std::string_view v = jump_break.get();
+    return v == "rare" ? 0.2f : v == "sometimes" ? 0.45f : v == "often" ? 0.8f : 0.0f;
+}
+
+struct Flight {
+    uint64_t veh = 0, body = 0;                    // body cached per car (stable for the session): 2 reads per car per tick
+    float vy = 0, vy_min = 0, vy_max = 0;
+    DWORD last = 0, start = 0, rolled = 0;
+    int fall = 0, ground = 0;
+    bool air = false;
+};
+Flight g_flights[32];
+uint32_t g_jump_rng = 0x9e3779b9u;
+float jump_rnd()
+{
+    g_jump_rng ^= g_jump_rng << 13, g_jump_rng ^= g_jump_rng >> 17, g_jump_rng ^= g_jump_rng << 5;
+    return float(g_jump_rng & 0xFFFFFF) / float(0x1000000);
+}
+
+float susp_threshold(uint64_t comp)
+{
+    uint32_t a = 0, b = 0;
+    if (!kizi::read(comp + 0x58, a) || !kizi::read(comp + 0x60, b))
+        return 0;
+    uint32_t x = a ^ b;
+    float f;
+    memcpy(&f, &x, 4);
+    return std::isfinite(f) && f > 0 && f < 1e6f ? f : 0;
+}
+
+void landed(int idx, Flight &f, float secs)
+{
+    float chance = jump_chance();
+    uint64_t comp = 0;
+    bool you = human(f.veh);
+    float landing = std::max(0.0f, -f.vy_min);                       // vertical speed at touchdown (m/s)
+    // 0.6.5: a real jump goes up and comes down. Cars going over a crest (vertical speed falling towards 0, never really
+    // falling) and a car bouncing on another one every 2 s were counted in 0.6.4; now the car must land at 1.5 m/s or more
+    // after having risen, and each car rolls at most once per 10 s.
+    if (td_owns_suspension()) {                    // Terminal Damage runs its own suspension model
+        static DWORD told = 0;
+        if (GetTickCount() - told > 60000)
+            swofty::log("[ai-tweaks] jump: car %d flew %.2f s - suspension left to Terminal Damage", idx, secs), told = GetTickCount();
+        return;
+    }
+    if (chance <= 0 || secs < 0.3f || landing < 1.5f || f.vy_max < 0.5f || GetTickCount() - f.rolled < 10000 ||
+        (you && !jump_you.get()) || !kizi::read(f.veh + 0x5d0, comp) || !comp)
+        return;
+    f.rolled = GetTickCount();
+    float p = chance * std::clamp((secs - 0.3f) / 0.7f + std::max(0.0f, landing - 3.0f) / 6.0f, 0.15f, 1.0f);
+    float roll = jump_rnd();
+    if (roll >= p) {
+        swofty::log("[ai-tweaks] jump: car %d (%s) flew %.2f s, landed at %.1f m/s, suspension held (roll %.2f >= %.2f)", idx,
+                    you ? "YOU" : "AI", secs, landing, roll, p);
+        return;
+    }
+    float thr = susp_threshold(comp);
+    if (thr <= 0)
+        return;
+    static const char *const names[4] = {"rear left", "rear right", "front left", "front right"};
+    int corner = int(jump_rnd() * 4) & 3;
+    uintptr_t at = comp + 0x130 + 4 * corner;
+    float now = 0;
+    kizi::read(at, now);
+    bool brk = jump_damage.get() == "break";
+    if (!brk && now >= thr * 0.7f) {               // that corner is already badly damaged: leave it
+        swofty::log("[ai-tweaks] jump: car %d (%s) flew %.2f s, %s suspension already damaged (%.2f of %.2f)", idx,
+                    you ? "YOU" : "AI", secs, names[corner], now, thr);
+        return;
+    }
+    float to = brk ? thr * 1.02f : std::min(thr * 0.95f, std::max(now, thr * (0.7f + 0.25f * jump_rnd())));
+    if (to > now)
+        kizi::write(at, &to, 4);
+    swofty::log("[ai-tweaks] jump: car %d (%s) flew %.2f s, landed at %.1f m/s -> %s suspension %s (%.2f -> %.2f of %.2f)", idx,
+                you ? "YOU" : "AI", secs, landing, names[corner], brk ? "BROKEN" : "damaged", now, std::max(now, to), thr);
+}
+
+void track_jumps()
+{
+    if (!g_vehicles || jump_chance() <= 0)
+        return;
+    DWORD t = GetTickCount();
+    for (int i = 0; i < 32; i++) {
+        Flight &f = g_flights[i];
+        uint64_t veh = 0;
+        float vy = 0;
+        if (!kizi::read(g_vehicles + i * 8, veh) || !veh) {
+            f = Flight{};
+            continue;
+        }
+        if (f.veh != veh) {                        // new car in this slot (new session)
+            f = Flight{};
+            f.veh = veh, f.body = body_of(veh);
+        }
+        if (!f.body || !kizi::read(f.body + 0x224, vy) || !std::isfinite(vy)) {
+            f.body = body_of(veh);                 // the body moved (car rebuilt): find it again next tick
+            continue;
+        }
+        if (!f.last) {
+            f.vy = vy, f.last = t;
+            continue;
+        }
+        float dt = float(t - f.last) / 1000.0f;
+        if (dt < 0.03f)
+            continue;
+        if (dt > 0.2f) {                           // paused / hitch: start over
+            f.vy = vy, f.last = t, f.fall = f.ground = 0, f.air = false;
+            continue;
+        }
+        float a = (vy - f.vy) / dt;                // vertical acceleration (m/s^2); free fall is about -9.8 or less
+        if (!f.air) {
+            f.fall = a < -7.0f ? f.fall + 1 : 0;
+            f.vy_max = f.fall ? std::max(f.vy_max, f.vy) : f.vy;       // vertical speed when the fall began (did it rise?)
+            if (f.fall >= 3)
+                f.air = true, f.start = t - 150, f.vy_min = vy, f.ground = 0;
+        } else {
+            f.vy_min = std::min(f.vy_min, vy);
+            f.ground = a > -3.0f ? f.ground + 1 : 0;
+            if (f.ground >= 2) {
+                landed(i, f, float(t - f.start - 100) / 1000.0f);
+                f.air = false, f.fall = 0;
+            } else if (t - f.start > 6000)
+                f.air = false, f.fall = 0;     // something else (a long fall off the world): give up
+        }
+        f.vy = vy, f.last = t;
+    }
 }
 
 void worker()
 {
-    bool down9 = false, down10 = false;
     for (int tick = 0;; tick++) {
         Sleep(50);
+        track_jumps();
+        aero_compute();
+        if (tick % 600 == 0 && (g_aero_lowered || g_aero_wanted)) {
+            swofty::log("[ai-tweaks] aero loss, last 30 s: %d slide(s) seen (largest slip %.0f deg), %d with less downforce, lowest %.0f %% "
+                        "of the car's own", g_aero_wanted.exchange(0), double(g_aero_beta_max.exchange(0)), g_aero_lowered.exchange(0),
+                        double(g_aero_min.exchange(1.0f)) * 100.0);
+        }
+        if (tick % 40 == 5)
+            equal_damage_tick();
         if (tick % 20 == 0)
             apply();
         if (contact_log.get())
             log_contacts();
         if (tick % 20 == 0)
-            wrap_controllers();
-        if (tick % 600 == 0 && g_stuns)
-        {
-            int n = g_stuns.exchange(0);
-            swofty::log("[ai-tweaks] reaction time, last 30 s: %d AI car(s) slowed after a hit, average %u ms, longest %u ms, "
-                        "hardest hit %.1f m/s", n, n ? g_stun_ms_sum.exchange(0) / unsigned(n) : 0u, g_stun_ms_max.exchange(0),
-                        double(g_impact_max.exchange(0)));
-        }
+            find_ai_hit();
         if (tick % 600 == 0 && g_spins) {
             swofty::log("[ai-tweaks] contact spin, last 30 s: %d AI car(s) given spin, largest %.0f deg/s",
                         g_spins.exchange(0), g_spin_max.exchange(0) * 57.3f);
@@ -869,27 +1139,6 @@ void worker()
             swofty::log("[ai-tweaks] contact log, last 30 s: %d AI-AI touch(es), %d you-AI", g_ai_ai, g_ai_you);
             g_ai_ai = g_ai_you = 0;
         }
-        bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000;
-        bool now9 = ctrl && (GetAsyncKeyState(VK_F9) & 0x8000), now10 = ctrl && (GetAsyncKeyState(VK_F10) & 0x8000);
-        if (now9 && !down9) {
-            bool off = !soft_off();
-            g_soft_key = off ? 1 : 0;
-            apply();
-            osd::show(off ? "CONTACT SOFTENING: OFF" : "CONTACT SOFTENING: GAME", off ? "REALISTIC CONTACT" : "");
-            Beep(off ? 1000 : 500, 150);
-        }
-        if (now10 && !down10 && !sim::cfg::active()) {   // the wheel push is a Classic feature
-            int t = (push_index() + 1) % LEVELS;
-            g_push_key = t;
-            apply();
-            osd::show("WHEEL PUSH: " + upper(PUSH[t].name),
-                      t ? "LEVEL " + std::to_string(t) + " OF " + std::to_string(LEVELS - 1) : "");
-            if (t == 0)
-                Beep(400, 300);
-            for (int i = 0; i < t; i++)
-                Beep(1000 + 150 * t, 100), Sleep(70);
-        }
-        down9 = now9, down10 = now10;
     }
 }
 
@@ -905,11 +1154,6 @@ SWOFTY_ON_CHANGE(wheel_push, std::string_view)
 {
     g_push_key = -1;
     apply();
-}
-
-SWOFTY_ON_CHANGE(osd_message, bool on)
-{
-    osd::enabled = on;
 }
 
 SWOFTY_ON_LOAD
@@ -928,20 +1172,6 @@ SWOFTY_ON_LOAD
                                         "ai-tweaks: front wing field"))
         kizi::read(hit + 3, g_wing_field);
     swofty::log("[ai-tweaks] contact log %s (%s)", g_ring ? "ready" : "NOT available", contact_log.get() ? "on" : "off");
-    // ControllerSet table (vehicle input code): mov rcx,[rip+G] ... mov rcx,[rcx+V]; mov rcx,[rcx+rdx*8]; mov edx,[rcx+M]
-    if (uintptr_t hit = kizi::scan_code("48 8B 49 ?? 48 8B 0C D1 8B 51 ?? 33 51 ??", "ai-tweaks: controller sets")) {
-        for (uintptr_t a = hit - 8; a >= hit - 32; a--) {
-            uint8_t op[3] = {};
-            int32_t d = 0;
-            if (kizi::read(a, op, 3) && op[0] == 0x48 && op[1] == 0x8B && op[2] == 0x0D && kizi::read(a + 3, d)) {
-                g_sets_global = a + 7 + d;
-                kizi::read(hit + 3, g_sets_vec);
-                break;
-            }
-        }
-    }
-    swofty::log("[ai-tweaks] AI reaction time %s (%.*s s)", g_sets_global ? "ready" : "NOT available",
-                (int)reaction.get().size(), reaction.get().data());
     g_add_puncture = reinterpret_cast<AddPunctureFn>(
         kizi::scan_code("41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 28 4C 89 C7 89 D3 48 89 CE 48 8B 49 28 FF 15",
                         "ai-tweaks: add puncture"));
@@ -961,11 +1191,6 @@ SWOFTY_ON_LOAD
                 g_slot[0] && g_slot[1] ? "found" : "NOT found", g_params ? "found" : "NOT found",
                 (int)softening.get().size(), softening.get().data(), (int)wheel_push.get().size(),
                 wheel_push.get().data());
-    osd::enabled = osd_message.get();
-    {
-        bool box = osd::start();
-        swofty::log("[ai-tweaks] on-screen messages: %s", swofty::hud::available() ? "game race notification" : box ? "box on screen" : "not available on this launcher (beeps only)");
-    }
     apply();
     std::thread(worker).detach();
     if (g_ring)
@@ -974,6 +1199,11 @@ SWOFTY_ON_LOAD
                 (int)contact_spin.get().size(), contact_spin.get().data(), (int)spin_who.get().size(),
                 spin_who.get().data());
     sim::start();                                  // its hook does nothing until Physics mode is Realistic
+    {
+        auto r = swofty::events::on_frame(&aero_frame, nullptr);
+        swofty::log("[ai-tweaks] aero loss when sideways: %s (%.*s)", r == swofty::events::Result::ok ? "ready" : "frame callback refused",
+                    (int)aero_loss.get().size(), aero_loss.get().data());
+    }
     swofty::log("[ai-tweaks] physics mode: %.*s", (int)physics_mode.get().size(), physics_mode.get().data());
 }
 
