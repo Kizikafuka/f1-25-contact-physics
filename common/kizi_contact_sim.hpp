@@ -67,6 +67,11 @@ inline bool tyre_spin() { return ::tyre_spin.get(); }
 inline bool ai_impulse() { return ::ai_impulse.get(); }
 inline bool walls() { return true; }
 inline float damage_boost() { return 0.0f; }
+inline std::string_view safety_limits() { return "all"; }
+inline float big_bounce() { return 1.0f; }
+inline float launch_boost() { return 1.0f; }
+inline float launch_cap() { return 3.0f; }
+inline void lifted(uint64_t, float) {}
 #endif
 }  // namespace sim::cfg
 #endif
@@ -215,6 +220,7 @@ struct Sample {
     float ratio, ny_old, ny_new, vn, delta_v, vt, mu_used, lift;
     uint64_t body_a, body_b;                       // for the per-touch log (the worker reads their height afterwards)
     float dvy_a, dvy_b;                            // vertical speed we gave each car in this record (m/s)
+    float tread;                                   // tyre touch: 1 = tread on tread, 0 = sidewall on sidewall (0.9.0)
 };
 constexpr uint32_t RING = 4096;                    // ~800 records/s, the worker reads every 50 ms
 Sample g_ring[RING];
@@ -222,6 +228,11 @@ std::atomic<uint32_t> g_ring_next{0};
 std::atomic<uint32_t> g_seen{0}, g_carcar{0}, g_tyre{0}, g_rewritten{0}, g_applied{0}, g_ignored{0};
 std::atomic<float> g_max_dv{0}, g_max_ny{0}, g_max_lift{0};
 std::atomic<uint32_t> g_spin_touches{0}, g_step_capped{0};
+// 0.9.0 (the iRacing guide pass): tread / sidewall tyre touches, bounces spread over several steps, lifts capped, friction
+// pushes trimmed by the energy guard (logged every 30 s)
+std::atomic<uint32_t> g_tread_touches{0}, g_side_touches{0}, g_spread{0}, g_lift_capped{0}, g_guard_trims{0};
+std::atomic<uint32_t> g_wow{0};                    // 1.1.0: wheel-over-wheel records at speed (tread on tread above 120 km/h)
+std::atomic<float> g_lift_asked{0};
 // why a record was not handled: 0 no object, 1 no vehicle (wall / ground), 2 same vehicle, 3 car A load, 4 car B load, 5 apply-to,
 // 6 contact point / normal, 7 neither car flagged (veh+0x130 bit 3)
 std::atomic<uint32_t> g_rej[8];
@@ -248,8 +259,12 @@ float friction_scale()
 float exaggerate_factor()
 {
     std::string_view v = cfg::exaggerate();
-    return v == "1.5" ? 1.5f : v == "2" ? 2.0f : v == "3" ? 3.0f : 1.0f;
+    return v == "1.5" ? 1.5f : v == "2" ? 2.0f : v == "3" ? 3.0f : v == "5" ? 5.0f : v == "10" ? 10.0f : v == "20" ? 20.0f : 1.0f;
 }
+// 0.9.9: above x3 the caps grow with the strength (bounce 0.8 x strength / 3, friction = strength), so x5 / x10 / x20 really
+// push harder: cars leave a hit faster than they came in (arcade). Up to x3 the 0.8 / 3.0 caps are unchanged.
+float bounce_cap(float x) { return std::max(0.8f, 0.8f * x / 3.0f); }
+float friction_cap(float x) { return std::max(3.0f, x); }
 float separation_speed()
 {
     std::string_view v = cfg::separation();
@@ -482,6 +497,18 @@ void on_contact(uint64_t contact)
     s.tyre = tyre;
     if (tyre)
         g_tyre++;
+    // Tread or sidewall (0.9.0, iRacing 2021 S3: "sidewall properties different from tread"). The line between the two wheel
+    // centres along the cars' axles = wheels side by side = sidewall on sidewall: low grip, no rolling rub, mostly a sideways
+    // push. Along the cars' length = a front tyre into a rear tyre = tread on tread: full grip with the tyres' spin (the
+    // launch). In between it blends.
+    float tread = 1.0f;
+    if (tyre) {
+        V3 wl = norm(cB - cA);
+        float side = 0.5f * (std::fabs(dot(wl, norm(A.left))) + std::fabs(dot(wl, norm(B.left))));
+        tread = std::clamp((0.85f - side) / 0.5f, 0.0f, 1.0f);   // side >= 0.85: sidewall, <= 0.35: tread
+        (tread >= 0.5f ? g_tread_touches : g_side_touches)++;
+    }
+    s.tread = tread;
     V3 old_n = norm(N);
     s.ny_old = std::fabs(old_n.y);
 
@@ -515,8 +542,9 @@ void on_contact(uint64_t contact)
             n = n * -1.0f;
         V3 rA = P - A.com, rB = P - B.com;
         V3 vrel = point_velocity(A, rA) - point_velocity(B, rB);
+        V3 vrel_body = vrel;                       // the bodies' own speed, without the rolling-tyre surfaces
         if (tyre && cfg::tyre_spin()) {             // the two tyre surfaces also move (rolling), see tyre_surface_velocity
-            V3 sv = tyre_surface_velocity(A, cA, P) - tyre_surface_velocity(B, cB, P);
+            V3 sv = (tyre_surface_velocity(A, cA, P) - tyre_surface_velocity(B, cB, P)) * tread;   // sidewalls: no rub
             sv = sv - n * dot(sv, n);              // only the part along the surface matters (friction)
             if (finite(sv)) {
                 vrel = vrel + sv;
@@ -524,11 +552,18 @@ void on_contact(uint64_t contact)
             }
         }
         float vn = dot(vrel, n);                   // > 0: approaching
-        float x = exaggerate_factor();
-        // Bounce depends on the impact speed (0.6.7): a low-speed tap bounces off more, a big hit crumples and keeps less
-        // (x1.6 of the setting at 2 m/s closing speed or less, down to x0.5 at 15 m/s or more).
-        float e_speed = std::clamp(1.6f - (std::max(vn, 0.0f) - 2.0f) * (1.1f / 13.0f), 0.5f, 1.6f);
-        float e = std::min(restitution_value() * x * e_speed, 0.8f), vmin = separation_speed();
+        // 1.1.0 overhaul, bounce: real values for every touch. Rubber on rubber keeps about a third of the closing speed at a
+        // tap and less in a harder hit (0.35 at 2 m/s or less, 0.15 from 10 m/s); carbon bodywork crumples (0.15 -> 0.05).
+        // Until 1.0 a tap bounced off at up to 0.8 of its speed (bounce High x1.6 for taps, x the preset's strength): touches
+        // felt springy and stiff. The "Crashes" level adds bounce to big hits only (from 4 m/s closing, full from 12 m/s).
+        float vpos = std::max(vn, 0.0f), hard = std::clamp((vpos - 2.0f) / 8.0f, 0.0f, 1.0f);
+        float x = 1.0f + (cfg::big_bounce() - 1.0f) * std::clamp((vpos - 4.0f) / 8.0f, 0.0f, 1.0f);
+        float e = std::min((tyre ? 0.35f - 0.20f * hard : 0.15f - 0.10f * hard) * x, bounce_cap(cfg::big_bounce())),
+              vmin = separation_speed();
+        // 0.9.5: the 0.9 limits are a setting ("safety limits": all / launch cap only / off; off = the 0.8 contact)
+        bool limits_all = cfg::safety_limits() == "all", limit_launch = limits_all || cfg::safety_limits() == "launch";
+        if (limits_all && vn < 0.5f)
+            e = 0.0f;                              // 0.9.0: no bounce from a lean or a brush (no buzz when cars rest on each other)
         bool keep_engine = cfg::engine_response() != "ignore";
         float k = k_along(A, rA, n) + k_along(B, rB, n);
         s.vn = vn;
@@ -558,11 +593,12 @@ void on_contact(uint64_t contact)
             uint64_t a, b;
             float v;
             DWORD t;
+            float up;                              // vertical speed given in this hit so far (lighter car, m/s)
         };
         static BounceSlot bounces[64];
         BounceSlot &bs = bounces[((A.body >> 5) ^ (B.body >> 7)) & 63];
         if (bs.a != A.body || bs.b != B.body || GetTickCount() - bs.t > 250)
-            bs = {A.body, B.body, 0.0f, GetTickCount()};
+            bs = {A.body, B.body, 0.0f, GetTickCount(), 0.0f};
         float dv = 0, jn = 0, load = 0;            // our speed change along n, our normal impulse, the load friction may use
         if (!step_full && k > 1e-6f && std::isfinite(vn)) {
             if (keep_engine) {
@@ -574,10 +610,19 @@ void on_contact(uint64_t contact)
                     load = vn / k;                 // about the impulse the solver applies in this step
                     bs.v = std::max(bs.v, std::min(e * vn, 40.0f)), bs.t = GetTickCount();
                 } else if (bs.v > 0) {
-                    dv = bs.v + vn;                // vn <= 0: the cars already separate at -vn; top up to the bounce
-                    bs.v = 0;
+                    // vn <= 0: the cars already separate at -vn; top up to the bounce. 0.9.0: spread over several records (half
+                    // of what is missing each time, about 3 - 4 physics steps) instead of all at once, like the penalty method's
+                    // impact that lasts tens of milliseconds: heavier, easier to catch. If the cars part first, the rest is lost.
+                    float want = bs.v + vn;
+                    dv = limits_all && want > 0.3f ? 0.5f * want : want;
+                    if (dv == want)
+                        bs.v = 0;
+                    else
+                        g_spread++;
                     if (dv > 0.01f)
                         jn = dv / k;
+                    else
+                        bs.v = 0;
                 }
             } else {
                 float vn_target = -std::max(vmin, vn > 0 ? e * vn : 0.0f);   // wanted normal speed afterwards
@@ -590,16 +635,54 @@ void on_contact(uint64_t contact)
         if (jn > 0 || load > 0) {
             V3 vt = vrel - n * vn;
             // hot racing slicks on rubber 1.8, carbon bodies 0.6 (0.0.8: the textbook 1.0 / 0.3 felt like nothing in tests)
-            float vtl = len(vt), jt = 0, mu = std::min((tyre ? 1.8f : 0.6f) * friction_scale() * x, 3.0f);
+            // 0.9.0: sidewall on sidewall less grip than tread on tread (blended by the touch's direction); 0.9.2: sidewall 1.2
+            // (0.8 made side-by-side wheel banging, most of the contact in a battle, feel like the game's own)
+            // 1.1.0: tread on tread 1.5 (warm slicks, rolling), sidewall on sidewall 0.8, carbon on carbon 0.35; no multiplier
+            // (1.0 multiplied by the preset's strength up to x10: rubbing cars grabbed each other, another source of "stiff").
+            float vtl = len(vt), jt = 0, mu = (tyre ? 0.8f + 0.7f * tread : 0.35f) * friction_scale();
             mu *= std::max(0.5f, 1.0f - vtl / 80.0f);   // rubber grips less the faster it slides (0.6.7): half at 40 m/s
             V3 t{};
             if (vtl > 1e-3f && mu > 0 && load > 0) {
                 t = vt * (1.0f / vtl);
                 float kt = k_along(A, rA, t) + k_along(B, rB, t);
-                if (kt > 1e-6f)
+                if (kt > 1e-6f) {
                     jt = std::min(vtl / kt, mu * load);
+                    // Energy guard (0.9.0): the rub may move the bodies along the surface by no more than they already slide
+                    // or close in (x (1 + bounce)), so a touch never throws the cars faster than the hit was. 0.9.2: not for
+                    // tread on tread, where the rolling rub IS the real wheel-over-wheel launch (the launch cap below limits it).
+                    if (limits_all && (!tyre || tread < 0.5f)) {
+                        V3 vtb = vrel_body - n * dot(vrel_body, n);
+                        float guard = std::max(len(vtb), std::max(vn, 0.0f) * (1.0f + e)) / kt;
+                        if (jt > guard)
+                            jt = guard, g_guard_trims++;
+                    }
+                }
             }
             V3 J = n * jn + t * jt;                // impulse that acts on B; A gets the opposite
+            // 1.1.0, wheel over wheel at speed: a front tyre into a rear tyre (tread on tread) above 120 km/h is how real
+            // airborne crashes start. The "Crashes" level multiplies the vertical part of that rub (and the cap below).
+            if (tyre && tread >= 0.5f && std::max(len(A.lin), len(B.lin)) > 33.0f) {
+                J.y *= cfg::launch_boost();
+                g_wow++;
+            }
+            // Launch cap (0.9.0): body on body keeps half of the upward part (cars climb over each other less); a tyre touch may
+            // lift the lighter car by at most 3 m/s, so launches still happen but not absurd ones. 0.9.2: the lift given so far
+            // fades (x0.85 per record) instead of adding up, so a long rub of tiny pushes no longer blocks all lift.
+            {
+                float inv = std::max(A.invm, B.invm), upv = std::fabs(J.y) * inv;
+                if (!tyre) {
+                    if (limits_all)
+                        J.y *= 0.5f;
+                } else if (limit_launch && upv > 0 && inv > 0) {
+                    float room = std::max(0.0f, cfg::launch_cap() - bs.up);
+                    if (upv > room) {
+                        if (upv > g_lift_asked)
+                            g_lift_asked = upv;
+                        J.y *= room / upv, g_lift_capped++;
+                    }
+                    bs.up = bs.up * 0.85f + std::fabs(J.y) * inv;
+                }
+            }
             if (finite(J) && (jn > 0 || jt > 0)) {
                 alignas(16) float ja[4] = {-J.x, -J.y, -J.z, 0}, jb[4] = {J.x, J.y, J.z, 0};
                 alignas(16) float pt[4] = {P.x, P.y, P.z, 1};
@@ -611,6 +694,10 @@ void on_contact(uint64_t contact)
                 if (push_b)
                     g_apply(reinterpret_cast<void *>(B.body), jb, pt);
                 g_applied++;
+                if (s.dvy_a > 0.05f)               // 1.1.1: the host follows a car this throws up (flights)
+                    cfg::lifted(A.body, s.dvy_a);
+                if (s.dvy_b > 0.05f)
+                    cfg::lifted(B.body, s.dvy_b);
                 s.delta_v = std::max(dv, vn), s.vt = vtl, s.mu_used = mu;
                 float lift = std::fabs(J.y) * std::max(A.invm, B.invm);   // vertical speed change of the lighter side (m/s)
                 s.lift = lift;
@@ -656,7 +743,7 @@ struct Touch {
     Watch c[2];
     DWORD first = 0, last = 0;
     int steps = 0, tyre_steps = 0;
-    float ny_max = 0, vn_max = 0;
+    float ny_max = 0, vn_max = 0, tread_sum = 0;
 };
 
 void worker()
@@ -692,7 +779,7 @@ void worker()
                 Touch &t = it->second;
                 t.last = now, t.steps++;
                 if (s.tyre)
-                    t.tyre_steps++;
+                    t.tyre_steps++, t.tread_sum += s.tread;
                 t.ny_max = std::max(t.ny_max, s.ny_new), t.vn_max = std::max(t.vn_max, s.vn);
                 t.c[swap ? 1 : 0].given += s.dvy_a, t.c[swap ? 0 : 1].given += s.dvy_b;
                 if (body_left > 0 && !s.tyre && s.delta_v > 0) {
@@ -727,8 +814,9 @@ void worker()
                                  w.vy_peak, w.given);
                         return std::string(b);
                     };
-                    swofty::log(SIM_TAG " touch %s: %d record(s), %d tyre-on-tyre, max closing %.1f m/s, steepest normal.y %.2f | %s | %s",
-                                t.tyre_steps ? "TYRE" : "body", t.steps, t.tyre_steps, t.vn_max, t.ny_max,
+                    swofty::log(SIM_TAG " touch %s: %d record(s), %d tyre-on-tyre (tread %.0f %%), max closing %.1f m/s, steepest normal.y %.2f | %s | %s",
+                                t.tyre_steps ? "TYRE" : "body", t.steps, t.tyre_steps,
+                                t.tyre_steps ? 100.0 * t.tread_sum / t.tyre_steps : 0.0, t.vn_max, t.ny_max,
                                 car(t.c[0]).c_str(), car(t.c[1]).c_str());
                 }
                 it = touches.erase(it);
@@ -753,6 +841,13 @@ void worker()
                             g_applied.exchange(0), g_ignored.exchange(0), g_max_dv.exchange(0), g_max_ny.exchange(0),
                             g_spin_touches.exchange(0), double(g_max_lift.exchange(0)), g_step_capped.exchange(0));
 #if KIZI_SIM_HEAVY
+            if (g_tread_touches.load() || g_side_touches.load() || g_spread.load() || g_lift_capped.load() || g_guard_trims.load())
+                swofty::log(SIM_TAG " tyres, last 30 s: %u tread / %u sidewall touch(es), %u wheel-over-wheel record(s) at speed "
+                            "(lift x%.1f), %u bounce top-up(s) spread, %u lift(s) capped at %.0f m/s (largest asked %.1f m/s), %u rub "
+                            "push(es) trimmed by the energy guard",
+                            g_tread_touches.exchange(0), g_side_touches.exchange(0), g_wow.exchange(0), double(cfg::launch_boost()),
+                            g_spread.exchange(0), g_lift_capped.exchange(0), double(cfg::launch_cap()), double(g_lift_asked.exchange(0)),
+                            g_guard_trims.exchange(0));
             if (g_walls.load() || g_wing_hits.load())
                 swofty::log(SIM_TAG " walls, last 30 s: %u record(s), hardest impact %.1f m/s (object %s), %u rebound(s) absorbed "
                             "(fastest %.1f m/s), %u loose part / cone / sign / kerb contact(s) skipped | energy wing damage: %u hit(s), largest %.3f",
